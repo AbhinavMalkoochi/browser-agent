@@ -38,11 +38,39 @@ class CDPClient:
 async def main():
     cdp = CDPClient("ws://127.0.0.1:9222/devtools/page/774356D7C98129A1BB6580024E5DEC91")
     await cdp.connect()
-
     await cdp.send("Page.enable", {})
-    result = await cdp.send("Page.navigate", {"url": "https://news.ycombinator.com"})
-    print(f"Navigated: {result}")
+    await cdp.send("Runtime.enable", {})
+    await cdp.send("DOM.enable", {})
+    await cdp.send("Page.navigate", {"url": "https://enkymarketing.com"})
+    await asyncio.sleep(2)
+    
+    visible_elements = await cdp.send("Runtime.evaluate", {
+        "expression": """
+        (() => {
+        const rect = el => el.getBoundingClientRect();
+        const isVisible = el => {
+            const r = rect(el);
+            return !!(r.width && r.height && r.bottom >= 0 && r.right >= 0 &&
+                    r.top <= window.innerHeight && r.left <= window.innerWidth) &&
+                getComputedStyle(el).visibility !== 'hidden' &&
+                getComputedStyle(el).display !== 'none';
+        };
+        return Array.from(document.querySelectorAll('*'))
+            .filter(isVisible)
+            .map(el => ({
+            tag: el.tagName.toLowerCase(),
+            id: el.id,
+            cls: el.className,
+            rect: rect(el).toJSON(),
+            text: el.innerText.slice(0, 100)
+            }));
+        })()
+        """,
+        "returnByValue": True
+    })
+    elements = visible_elements["result"]["value"]
+    print(f"Found {len(elements)} visible elements")
+    print(elements[:5])
 
-    await asyncio.sleep(3)  
 
 asyncio.run(main())
