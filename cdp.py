@@ -1,9 +1,27 @@
+#todo create a dict combining dom data w indexing
+#remove hidden elements,svgs/no text/interacctivity
+#find elements that are covered 
+#map so that llm can say -> click button and you find the nodeId, its coords, and click - tools for llm
+#convert tree to basic text
+
 from websockets.asyncio.client import connect
 import asyncio, json
 from typing import Dict
 from dom.main import get_dom
+import httpx
 
 import websockets
+
+
+async def get_page_ws_url(host="localhost", port=9222):
+    """Get the WebSocket URL for the first page target"""
+    async with httpx.AsyncClient() as client:
+        response = await client.get(f"http://{host}:{port}/json")
+        targets = response.json()
+        for target in targets:
+            if target.get("type") == "page":
+                return target["webSocketDebuggerUrl"]
+        raise RuntimeError("No page target found")
 class CDPClient:
     def __init__(self, ws_url: str):
         self.ws_url = ws_url
@@ -23,7 +41,7 @@ class CDPClient:
             json.dumps({"id": self.message_id, "method": method, "params": params or {}})
         )
         res = await future
-        return res.get("result")
+        return res
     async def listen(self):
         try:
             while True:
@@ -35,7 +53,7 @@ class CDPClient:
                     future = self.pending_message.pop(data["id"])
                     if not future.done():
                         if "error" in data:
-                            print("error")
+                            print(f"error: {data}")
                         else:
                             future.set_result(data["result"])
                     else:
@@ -62,16 +80,16 @@ class CDPClient:
 
 
 async def main():
-    cdp = CDPClient(
-        "ws://127.0.0.1:9222/devtools/page/774356D7C98129A1BB6580024E5DEC91"
-    )
+    ws_url = await get_page_ws_url()
+    cdp = CDPClient(ws_url)
     await cdp.connect()
     await cdp.send("Page.enable", {})
     await cdp.send("Runtime.enable", {})
     await cdp.send("DOM.enable", {})
     await cdp.send("Page.navigate", {"url": "https://enkymarketing.com"})
     await asyncio.sleep(2)
-    dom, snapshot, ax, metrics = await get_dom(cdp)
-
+    data = await get_dom(cdp)
+    for key, value in data.items():
+        print(f"{key.upper()}:", json.dumps(value, indent=2))
 
 asyncio.run(main())
