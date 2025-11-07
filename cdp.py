@@ -3,7 +3,7 @@ CDP Client - Chrome DevTools Protocol WebSocket client for browser automation.
 """
 import asyncio
 import json
-from typing import Dict
+from typing import Dict, Optional
 import httpx
 import websockets
 from websockets.asyncio.client import connect
@@ -41,20 +41,26 @@ class CDPClient:
         match = next((target for target in targets if target["type"]=='page'),None)
         res = await self.send("Target.attachToTarget",{"targetId":match["targetId"],"flatten":True})
         self.session_id = res["sessionId"]
-    async def enable_domains(self):
-        for domain in ["Page","Runtime","DOM","Network"]:
+        self.enable_domains(["DOM","Page","Network","Runtime"])
+    async def enable_domains(self,domains):
+        for domain in domains:
             await self.send(f"{domain}.enable",{},session_id=self.session_id)
     async def attach_to_target(self,target_id):
         res = await self.ws.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
         self.session_id=res["session_id"]
-        self.enable_domains()
-    async def send(self, method, params=None):
+        self.enable_domains(["DOM","Page","Network","Runtime"])
+        return self.session_id
+    async def get_session_id(self,target_id):
+        res = await self.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
+        self.session_id = res["sessionId"]
+    async def send(self, method,session_id:Optional[str], params=None ):
         """Send a CDP command and wait for response."""
         self.message_id += 1
         future = asyncio.Future()
+        s_id = session_id or self.session_id
         self.pending_message[self.message_id] = future
         await self.ws.send(
-            json.dumps({"id": self.message_id, "method": method, "params": params or {}})
+            json.dumps({"id": self.message_id, "method": method, "params": params or {}, "sessionId":s_id})
         )
         return await future
     async def listen(self):
