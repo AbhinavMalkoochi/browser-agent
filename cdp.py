@@ -31,12 +31,23 @@ class CDPClient:
         self.message_id = 1
         self.pending_message: Dict[int, asyncio.Future] = {}
         self.ws = None
-
+        self.session_id=None
     async def connect(self):
         """Connect to Chrome via WebSocket."""
         self.ws = await connect(self.ws_url)
         asyncio.create_task(self.listen())
-
+        await self.send("Target.setAutoAttach",{"autoAttach":True,"flatten":True,"waitForDebuggerOnStart":False})
+        targets = await self.send("Target.getTargets",{})
+        match = next((target for target in targets if target["type"]=='page'),None)
+        res = await self.send("Target.attachToTarget",{"targetId":match["targetId"],"flatten":True})
+        self.session_id = res["sessionId"]
+    async def enable_domains(self):
+        for domain in ["Page","Runtime","DOM","Network"]:
+            await self.send(f"{domain}.enable",{},session_id=self.session_id)
+    async def attach_to_target(self,target_id):
+        res = await self.ws.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
+        self.session_id=res["session_id"]
+        self.enable_domains()
     async def send(self, method, params=None):
         """Send a CDP command and wait for response."""
         self.message_id += 1
@@ -113,9 +124,9 @@ if __name__ == "__main__":
     async def main():
         enhanced_nodes = await get_enhanced_elements("https://enkymarketing.com")
         
-        print(f"🎯 Found {len(enhanced_nodes)} actionable elements:")
-        for i, node in enumerate(enhanced_nodes[:5], 1):
-            print(f"{i}. {node.tag_name.upper()} '{node.ax_name or node.text_content[:30]}'")
-            print(f"   Click: {node.click_point}, Confidence: {node.confidence_score:.2f}")
+        # print(f"🎯 Found {len(enhanced_nodes)} actionable elements:")
+        # for i, node in enumerate(enhanced_nodes[:5], 1):
+        #     print(f"{i}. {node.tag_name.upper()} '{node.ax_name or node.text_content[:30]}'")
+        #     print(f"   Click: {node.click_point}, Confidence: {node.confidence_score:.2f}")
     
     asyncio.run(main())
