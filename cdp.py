@@ -3,7 +3,7 @@
 #find elements that are covered 
 #map so that llm can say -> click button and you find the nodeId, its coords, and click - tools for llm
 #convert tree to basic text
-
+from enhanced_merger import BrowserDataMerger
 from websockets.asyncio.client import connect
 import asyncio, json
 from typing import Dict
@@ -91,5 +91,26 @@ async def main():
     data = await get_dom(cdp)
     for key, value in data.items():
         print(f"{key.upper()}:", json.dumps(value, indent=2))
+    merger = BrowserDataMerger()
+    enhanced_nodes = merger.merge_browser_data(
+        data['dom'],
+        data['snapshot'], 
+        data['ax'],
+        data['metrics']
+    )
+    print(f"\n🎯 ENHANCED NODES SUMMARY")
+    print(f"{'='*60}")
+    
+    for i, node in enumerate(enhanced_nodes[:10], 1):
+        print(f"\n{i}. {node.tag_name.upper()} '{node.ax_name or node.text_content[:30]}'")
+        print(f"   Backend ID: {node.backend_node_id}")
+        print(f"   Position: {node.bounds_css}")
+        print(f"   Click Point: {node.click_point}")
+        print(f"   Action: {node.action_type}")
+        print(f"   Role: {node.ax_role}")
+        print(f"   Confidence: {node.confidence_score:.2f}")
+        print(f"   Interactive: {node.is_interactive}, Clickable: {node.is_clickable}")
+    
+    print(f"\n✅ Successfully processed {len(enhanced_nodes)} actionable elements!")
 
 asyncio.run(main())
