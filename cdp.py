@@ -10,6 +10,7 @@ from websockets.asyncio.client import connect
 
 from dom.main import get_dom
 from enhanced_merger import BrowserDataMerger
+from targets import SessionManager
 
 
 async def get_page_ws_url(host="localhost", port=9222):
@@ -31,36 +32,78 @@ class CDPClient:
         self.message_id = 1
         self.pending_message: Dict[int, asyncio.Future] = {}
         self.ws = None
-        self.session_id=None
+        self.registry = SessionManager()
     async def connect(self):
         """Connect to Chrome via WebSocket."""
         self.ws = await connect(self.ws_url)
         asyncio.create_task(self.listen())
-        await self.send("Target.setAutoAttach",{"autoAttach":True,"flatten":True,"waitForDebuggerOnStart":False})
-        targets_result = await self.send("Target.getTargets",{})
+        
+        await self.send("Target.setAutoAttach", {
+            "autoAttach": True,
+            "flatten": True,
+            "waitForDebuggerOnStart": False
+        })
+        
+        targets_result = await self.send("Target.getTargets", {})
         target_infos = targets_result.get("targetInfos", [])
+        
+        for target_info in target_infos:
+            self.registry.add_target(
+                target_id=target_info["targetId"],
+                type=target_info.get("type", "unknown"),
+                url=target_info.get("url", ""),
+                title=target_info.get("title", ""),
+                browser_context_id=target_info.get("browserContextId")
+            )
+        
         match = next((target for target in target_infos if target.get("type") == 'page'), None)
         if not match:
             raise RuntimeError("No page target found")
-        res = await self.send("Target.attachToTarget",{"targetId":match["targetId"],"flatten":True})
-        self.session_id = res["sessionId"]
-        await self.enable_domains(["DOM","Page","Network","Runtime"])
-    async def enable_domains(self,domains):
+        
+        res = await self.send("Target.attachToTarget", {
+            "targetId": match["targetId"],
+            "flatten": True
+        })
+        session_id = res["sessionId"]
+        
+        self.registry.add_session(session_id, match["targetId"])
+        self.registry.set_active_session(session_id)
+        
+        await self.enable_domains(["DOM", "Page", "Network", "Runtime"], session_id)
+    async def enable_domains(self, domains, session_id: Optional[str] = None):
+        """Enable CDP domains for a session."""
+        if session_id is None:
+            session_id = self.registry.get_active_session()
+            if session_id is None:
+                raise RuntimeError("No active session available")
+        
         for domain in domains:
-            await self.send(f"{domain}.enable", {}, session_id=self.session_id)
-    async def attach_to_target(self,target_id):
-        res = await self.ws.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
-        self.session_id=res["session_id"]
-        self.enable_domains(["DOM","Page","Network","Runtime"])
-        return self.session_id
-    async def get_session_id(self,target_id):
-        res = await self.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
-        self.session_id = res["sessionId"]
+            if not self.registry.is_domain_enabled(session_id, domain):
+                await self.send(f"{domain}.enable", {}, session_id=session_id)
+                self.registry.mark_domain_enabled(session_id, domain)
+    
+    async def attach_to_target(self, target_id):
+        """Attach to a target and return the session ID."""
+        res = await self.send("Target.attachToTarget", {
+            "targetId": target_id,
+            "flatten": True
+        })
+        session_id = res["sessionId"]
+        
+        self.registry.add_session(session_id, target_id)
+        self.registry.set_active_session(session_id)
+        
+        await self.enable_domains(["DOM", "Page", "Network", "Runtime"], session_id)
+        return session_id
     async def send(self, method, params=None, session_id: Optional[str] = None):
         """Send a CDP command and wait for response."""
         self.message_id += 1
         future = asyncio.Future()
-        s_id = session_id if session_id is not None else self.session_id
+        
+        s_id = session_id
+        if s_id is None:
+            s_id = self.registry.get_active_session()
+        
         self.pending_message[self.message_id] = future
         
         message = {"id": self.message_id, "method": method, "params": params or {}}
@@ -69,6 +112,49 @@ class CDPClient:
         
         await self.ws.send(json.dumps(message))
         return await future
+    
+    def _handle_event(self, data: dict):
+        """Handle CDP events."""
+        method = data.get("method", "")
+        params = data.get("params", {})
+        
+        if method == "Target.attachedToTarget":
+            session_id = params.get("sessionId")
+            target_info = params.get("targetInfo", {})
+            target_id = target_info.get("targetId")
+            
+            if session_id and target_id:
+                self.registry.add_target(
+                    target_id=target_id,
+                    type=target_info.get("type", "unknown"),
+                    url=target_info.get("url", ""),
+                    title=target_info.get("title", ""),
+                    browser_context_id=target_info.get("browserContextId")
+                )
+                self.registry.add_session(session_id, target_id)
+        
+        elif method == "Target.detachedFromTarget":
+            session_id = params.get("sessionId")
+            if session_id:
+                self.registry.mark_session_disconnected(session_id)
+        
+        elif method == "Target.targetCreated":
+            target_info = params.get("targetInfo", {})
+            self.registry.add_target(
+                target_id=target_info.get("targetId"),
+                type=target_info.get("type", "unknown"),
+                url=target_info.get("url", ""),
+                title=target_info.get("title", ""),
+                browser_context_id=target_info.get("browserContextId")
+            )
+        
+        elif method == "Target.targetDestroyed":
+            target_id = params.get("targetId")
+            if target_id:
+                target = self.registry.get_target(target_id)
+                if target and target.session_id:
+                    self.registry.mark_session_disconnected(target.session_id)
+    
     async def listen(self):
         """Listen for CDP responses and events."""
         try:
@@ -88,7 +174,7 @@ class CDPClient:
                     else:
                         print("dup req")
                 elif "method" in data:
-                    pass
+                    self._handle_event(data)
                     
         except websockets.exceptions.ConnectionClosed:
             for future in self.pending_message.values():
@@ -107,11 +193,6 @@ async def get_enhanced_elements(url: str) -> list:
     ws_url = await get_page_ws_url()
     cdp = CDPClient(ws_url)
     await cdp.connect()
-    
-    # Enable required domains
-    await cdp.send("Page.enable", {})
-    await cdp.send("Runtime.enable", {})
-    await cdp.send("DOM.enable", {})
     
     # Navigate and wait for load
     await cdp.send("Page.navigate", {"url": url})
