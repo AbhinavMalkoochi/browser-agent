@@ -37,14 +37,17 @@ class CDPClient:
         self.ws = await connect(self.ws_url)
         asyncio.create_task(self.listen())
         await self.send("Target.setAutoAttach",{"autoAttach":True,"flatten":True,"waitForDebuggerOnStart":False})
-        targets = await self.send("Target.getTargets",{})
-        match = next((target for target in targets if target["type"]=='page'),None)
+        targets_result = await self.send("Target.getTargets",{})
+        target_infos = targets_result.get("targetInfos", [])
+        match = next((target for target in target_infos if target.get("type") == 'page'), None)
+        if not match:
+            raise RuntimeError("No page target found")
         res = await self.send("Target.attachToTarget",{"targetId":match["targetId"],"flatten":True})
         self.session_id = res["sessionId"]
-        self.enable_domains(["DOM","Page","Network","Runtime"])
+        await self.enable_domains(["DOM","Page","Network","Runtime"])
     async def enable_domains(self,domains):
         for domain in domains:
-            await self.send(f"{domain}.enable",{},session_id=self.session_id)
+            await self.send(f"{domain}.enable", {}, session_id=self.session_id)
     async def attach_to_target(self,target_id):
         res = await self.ws.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
         self.session_id=res["session_id"]
@@ -53,15 +56,18 @@ class CDPClient:
     async def get_session_id(self,target_id):
         res = await self.send("Target.attachToTarget",{"targetId":target_id,"flatten":True})
         self.session_id = res["sessionId"]
-    async def send(self, method,session_id:Optional[str], params=None ):
+    async def send(self, method, params=None, session_id: Optional[str] = None):
         """Send a CDP command and wait for response."""
         self.message_id += 1
         future = asyncio.Future()
-        s_id = session_id or self.session_id
+        s_id = session_id if session_id is not None else self.session_id
         self.pending_message[self.message_id] = future
-        await self.ws.send(
-            json.dumps({"id": self.message_id, "method": method, "params": params or {}, "sessionId":s_id})
-        )
+        
+        message = {"id": self.message_id, "method": method, "params": params or {}}
+        if s_id is not None:
+            message["sessionId"] = s_id
+        
+        await self.ws.send(json.dumps(message))
         return await future
     async def listen(self):
         """Listen for CDP responses and events."""
