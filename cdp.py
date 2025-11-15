@@ -3,7 +3,10 @@ CDP Client - Chrome DevTools Protocol WebSocket client for browser automation.
 """
 import asyncio
 import json
-from typing import Dict, Optional
+from typing import Dict, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from targets import TargetInfo
 import httpx
 import websockets
 from websockets.asyncio.client import connect
@@ -121,16 +124,19 @@ class CDPClient:
             session_id = params.get("sessionId")
             target_info = params.get("targetInfo", {})
             target_id = target_info.get("targetId")
+            target_url = target_info.get("url", "")
             
             if session_id and target_id:
                 self.registry.add_target(
                     target_id=target_id,
                     type=target_info.get("type", "unknown"),
-                    url=target_info.get("url", ""),
+                    url=target_url,
                     title=target_info.get("title", ""),
                     browser_context_id=target_info.get("browserContextId")
                 )
                 self.registry.add_session(session_id, target_id)
+                
+                self._map_target_to_frames(target_id, target_url, session_id)
         
         elif method == "Target.detachedFromTarget":
             session_id = params.get("sessionId")
@@ -139,13 +145,19 @@ class CDPClient:
         
         elif method == "Target.targetCreated":
             target_info = params.get("targetInfo", {})
+            target_id = target_info.get("targetId")
+            target_url = target_info.get("url", "")
+            
             self.registry.add_target(
-                target_id=target_info.get("targetId"),
+                target_id=target_id,
                 type=target_info.get("type", "unknown"),
-                url=target_info.get("url", ""),
+                url=target_url,
                 title=target_info.get("title", ""),
                 browser_context_id=target_info.get("browserContextId")
             )
+            
+            if target_info.get("type") == "page" and target_info.get("url"):
+                self._map_target_to_frames(target_id, target_url, None)
         
         elif method == "Target.targetDestroyed":
             target_id = params.get("targetId")
@@ -238,13 +250,28 @@ class CDPClient:
         url = frame_data.get("url", "")
         origin = frame_data.get("securityOrigin", "")
         
+        child_target_id = target_id
+        child_session_id = session_id
+        
+        if parent_frame_id:
+            parent_frame = self.registry.get_frame(parent_frame_id)
+            if parent_frame:
+                parent_origin = parent_frame.origin
+                is_cross_origin = origin != parent_origin and origin != "" and parent_origin != ""
+                
+                if is_cross_origin:
+                    target = self._find_target_for_cross_origin_frame(url, origin)
+                    if target and target.session_id:
+                        child_target_id = target.target_id
+                        child_session_id = target.session_id
+        
         self.registry.add_frame(
             frame_id=frame_id,
             parent_frame_id=parent_frame_id,
             url=url,
             origin=origin,
-            target_id=target_id,
-            session_id=session_id
+            target_id=child_target_id,
+            session_id=child_session_id
         )
         
         child_frames = frame_tree_node.get("childFrames", [])
@@ -252,9 +279,49 @@ class CDPClient:
             self._parse_frame_tree(
                 child_frame_tree,
                 parent_frame_id=frame_id,
-                target_id=target_id,
-                session_id=session_id
+                target_id=child_target_id,
+                session_id=child_session_id
             )
+    
+    def _find_target_for_cross_origin_frame(self, url: str, origin: str):
+        """Find the target that corresponds to a cross-origin frame."""
+        target = self.registry.find_target_by_url(url)
+        if target:
+            return target
+        
+        target = self.registry.find_target_by_origin(origin)
+        if target:
+            return target
+        
+        return None
+    
+    def _map_target_to_frames(self, target_id: str, target_url: str, session_id: Optional[str]):
+        """
+        Map a target to any frames that match it by URL or origin.
+        
+        This is called:
+        1. When Target.attachedToTarget fires (with session_id)
+        2. When Target.targetCreated fires (session_id may be None, will be set later)
+        """
+        if not target_url:
+            return
+        
+        target_origin = self.registry._extract_origin_from_url(target_url)
+        
+        for frame_id, frame in self.registry.frames.items():
+            if frame.target_id is None or frame.target_id != target_id:
+                frame_matches = (
+                    frame.url == target_url or
+                    target_url.startswith(frame.url) or
+                    frame.url.startswith(target_url) or
+                    (frame.origin and frame.origin == target_origin)
+                )
+                
+                if frame_matches:
+                    if session_id:
+                        self.registry.update_frame_target_mapping(frame_id, target_id, session_id)
+                    else:
+                        frame.target_id = target_id
     
     async def collect_all_frame_trees(self):
         """

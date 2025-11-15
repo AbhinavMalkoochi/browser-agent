@@ -151,4 +151,38 @@ class SessionManager:
     def get_frame_children(self, frame_id: str) -> List[str]:
         """Get list of child frame IDs for a given frame."""
         return self.children.get(frame_id, [])
+    
+    def find_target_by_url(self, url: str) -> Optional[TargetInfo]:
+        """Find a target by matching URL (exact or prefix match)."""
+        for target in self.targets.values():
+            if target.url == url or url.startswith(target.url) or target.url.startswith(url):
+                return target
+        return None
+    
+    def find_target_by_origin(self, origin: str) -> Optional[TargetInfo]:
+        """Find a target by matching security origin."""
+        for target in self.targets.values():
+            target_origin = self._extract_origin_from_url(target.url)
+            if target_origin == origin:
+                return target
+        return None
+    
+    def _extract_origin_from_url(self, url: str) -> str:
+        """Extract security origin from URL (scheme + host)."""
+        if not url:
+            return ""
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(url)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            return origin
+        except Exception:
+            return ""
+    
+    def update_frame_target_mapping(self, frame_id: str, target_id: str, session_id: str):
+        """Update a frame's target and session mapping."""
+        frame = self.frames.get(frame_id)
+        if frame:
+            frame.target_id = target_id
+            frame.session_id = session_id
 
