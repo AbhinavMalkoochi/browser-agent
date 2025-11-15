@@ -10,8 +10,7 @@ from websockets.asyncio.client import connect
 
 from dom.main import get_dom
 from enhanced_merger import BrowserDataMerger
-from targets import SessionManager
-
+from targets import SessionManager, SessionStatus
 
 async def get_page_ws_url(host="localhost", port=9222):
     """Get the WebSocket URL for the first page target."""
@@ -186,6 +185,90 @@ class CDPClient:
                 if not future.done():
                     future.set_exception(e)
             self.pending_message.clear()
+    async def get_frame_tree(self, session_id: Optional[str] = None):
+        """
+        Collect frame tree from a session and store frames in registry.
+        
+        This recursively parses the frame tree structure from Page.getFrameTree
+        and stores all frames with their parent-child relationships.
+        """
+        if session_id is None:
+            session_id = self.registry.get_active_session()
+            if session_id is None:
+                raise RuntimeError("No active session available")
+        
+        if not self.registry.is_domain_enabled(session_id, "Page"):
+            await self.enable_domains(["Page"], session_id)
+        
+        result = await self.send("Page.getFrameTree", session_id=session_id)
+        frame_tree = result.get("frameTree")
+        
+        if not frame_tree:
+            return
+        
+        session_info = self.registry.get_session(session_id)
+        target_id = session_info.target_id if session_info else None
+        
+        self._parse_frame_tree(frame_tree, parent_frame_id=None, target_id=target_id, session_id=session_id)
+    
+    def _parse_frame_tree(self, frame_tree_node: dict, parent_frame_id: Optional[str], 
+                         target_id: Optional[str], session_id: str):
+        """
+        Recursively parse a frame tree node and its children.
+        
+        frame_tree_node structure:
+        {
+          "frame": {
+            "id": "...",
+            "url": "...",
+            "securityOrigin": "...",
+            ...
+          },
+          "childFrames": [...]
+        }
+        """
+        frame_data = frame_tree_node.get("frame", {})
+        if not frame_data:
+            return
+        
+        frame_id = frame_data.get("id")
+        if not frame_id:
+            return
+        
+        url = frame_data.get("url", "")
+        origin = frame_data.get("securityOrigin", "")
+        
+        self.registry.add_frame(
+            frame_id=frame_id,
+            parent_frame_id=parent_frame_id,
+            url=url,
+            origin=origin,
+            target_id=target_id,
+            session_id=session_id
+        )
+        
+        child_frames = frame_tree_node.get("childFrames", [])
+        for child_frame_tree in child_frames:
+            self._parse_frame_tree(
+                child_frame_tree,
+                parent_frame_id=frame_id,
+                target_id=target_id,
+                session_id=session_id
+            )
+    
+    async def collect_all_frame_trees(self):
+        """
+        Collect frame trees from all active sessions.
+        
+        This should be called after page load to discover all frames,
+        including cross-origin iframes that have their own sessions.
+        """
+        for session_id, session_info in self.registry.sessions.items():
+            if session_info.status == SessionStatus.ACTIVE:
+                try:
+                    await self.get_frame_tree(session_id=session_id)
+                except Exception as e:
+                    print(f"Warning: Failed to get frame tree for session {session_id}: {e}")
 
 
 async def get_enhanced_elements(url: str) -> list:
@@ -193,30 +276,30 @@ async def get_enhanced_elements(url: str) -> list:
     ws_url = await get_page_ws_url()
     cdp = CDPClient(ws_url)
     await cdp.connect()
+    await cdp.get_frame_tree()    
+    # # Navigate and wait for load
+    # await cdp.send("Page.navigate", {"url": url})
+    # await asyncio.sleep(2)
     
-    # Navigate and wait for load
-    await cdp.send("Page.navigate", {"url": url})
-    await asyncio.sleep(2)
+    # # Get raw DOM data
+    # dom_data = await get_dom(cdp)
     
-    # Get raw DOM data
-    dom_data = await get_dom(cdp)
+    # # Process with enhanced merger
+    # merger = BrowserDataMerger()
+    # enhanced_nodes = merger.merge_browser_data(
+    #     dom_data['dom'],
+    #     dom_data['snapshot'], 
+    #     dom_data['ax'],
+    #     dom_data['metrics']
+    # )
     
-    # Process with enhanced merger
-    merger = BrowserDataMerger()
-    enhanced_nodes = merger.merge_browser_data(
-        dom_data['dom'],
-        dom_data['snapshot'], 
-        dom_data['ax'],
-        dom_data['metrics']
-    )
-    
-    return enhanced_nodes
+    # return enhanced_nodes
 
 
 if __name__ == "__main__":
     async def main():
-        enhanced_nodes = await get_enhanced_elements("https://enkymarketing.com")
-        
+        enhanced_nodes =   await get_enhanced_elements("https://enkymarketing.com")
+
         # print(f"🎯 Found {len(enhanced_nodes)} actionable elements:")
         # for i, node in enumerate(enhanced_nodes[:5], 1):
         #     print(f"{i}. {node.tag_name.upper()} '{node.ax_name or node.text_content[:30]}'")

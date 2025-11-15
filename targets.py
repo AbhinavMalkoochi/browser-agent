@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Set, Dict, Optional
+from typing import Set, Dict, Optional, List
 from enum import Enum
 import time
 
@@ -23,8 +23,13 @@ class TargetInfo:
 
 @dataclass
 class FrameInfo:
-    target_id: str
-    session_id: str
+    frame_id: str
+    parent_frame_id: Optional[str]
+    url: str
+    origin: str
+    target_id: Optional[str] = None
+    session_id: Optional[str] = None
+
 
 
 @dataclass
@@ -44,6 +49,7 @@ class SessionManager:
         self.sessions: Dict[str, SessionInfo] = {}
         self.targets: Dict[str, TargetInfo] = {}
         self.frames: Dict[str, FrameInfo] = {}
+        self.children: Dict[str, List[str]] = {}
         self.active_session_id: Optional[str] = None
     
     def add_session(self, session_id: str, target_id: str) -> SessionInfo:
@@ -115,4 +121,34 @@ class SessionManager:
             session.status = SessionStatus.DISCONNECTED
             if self.active_session_id == session_id:
                 self.active_session_id = None
+    
+    def add_frame(self, frame_id: str, parent_frame_id: Optional[str], url: str, 
+                  origin: str, target_id: Optional[str] = None, 
+                  session_id: Optional[str] = None) -> FrameInfo:
+        """Add a frame to the registry."""
+        frame_info = FrameInfo(
+            frame_id=frame_id,
+            parent_frame_id=parent_frame_id,
+            url=url,
+            origin=origin,
+            target_id=target_id,
+            session_id=session_id
+        )
+        self.frames[frame_id] = frame_info
+        
+        if parent_frame_id:
+            if parent_frame_id not in self.children:
+                self.children[parent_frame_id] = []
+            if frame_id not in self.children[parent_frame_id]:
+                self.children[parent_frame_id].append(frame_id)
+        
+        return frame_info
+    
+    def get_frame(self, frame_id: str) -> Optional[FrameInfo]:
+        """Get frame info by frame ID."""
+        return self.frames.get(frame_id)
+    
+    def get_frame_children(self, frame_id: str) -> List[str]:
+        """Get list of child frame IDs for a given frame."""
+        return self.children.get(frame_id, [])
 
