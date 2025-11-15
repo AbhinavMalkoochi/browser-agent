@@ -12,7 +12,7 @@ import websockets
 from websockets.asyncio.client import connect
 
 from dom.main import get_dom
-from enhanced_merger import BrowserDataMerger
+from enhanced_merger import BrowserDataMerger, EnhancedNode
 from targets import SessionManager, SessionStatus
 
 async def get_page_ws_url(host="localhost", port=9222):
@@ -336,8 +336,14 @@ class CDPClient:
                     await self.get_frame_tree(session_id=session_id)
                 except Exception as e:
                     print(f"Warning: Failed to get frame tree for session {session_id}: {e}")
-
-
+    def get_session_for_node(self,node:dict)->Optional[str]:
+        frame_id = node.get('frameId')
+        if not frame_id:
+            return self.registry.get_active_session()
+        return self.registry.get_session_from_frame(frame_id)
+    async def interact(self,node:EnhancedNode):
+        session_id = self.registry.get_session_from_frame(node.frame_id)
+        self.send("Some Action",{},session_id=session_id)
 async def get_enhanced_elements(url: str) -> list:
     """Get enhanced actionable elements from a webpage."""
     ws_url = await get_page_ws_url()

@@ -185,4 +185,6 @@ class SessionManager:
         if frame:
             frame.target_id = target_id
             frame.session_id = session_id
-
+    def get_session_from_frame(self,frame_id:str):
+        frame = self.frames.get(frame_id)
+        return frame.session_id if frame else None
