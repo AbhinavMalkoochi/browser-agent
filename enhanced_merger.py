@@ -11,7 +11,6 @@ from typing import List, Dict, Optional, Tuple, Any
 @dataclass
 class EnhancedNode:
     """Unified representation of a browser element with action metadata."""
-    frame_id: Optional[str]=None
     backend_node_id: int
     tag_name: str
     bounds_css: Tuple[float, float, float, float]
@@ -29,6 +28,8 @@ class EnhancedNode:
     paint_order: int
     action_type: str
     confidence_score: float
+    frame_id: Optional[str]=None
+
 
 class BrowserDataMerger:
     """Merges DOM, DOMSnapshot, and Accessibility data into enhanced nodes."""

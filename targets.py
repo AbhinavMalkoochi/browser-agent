@@ -185,6 +185,26 @@ class SessionManager:
         if frame:
             frame.target_id = target_id
             frame.session_id = session_id
-    def get_session_from_frame(self,frame_id:str):
+    def get_session_from_frame(self, frame_id: str):
+        """Get session ID for a given frame ID."""
         frame = self.frames.get(frame_id)
         return frame.session_id if frame else None
+    
+    def remove_frame(self, frame_id: str):
+        """Remove a frame and all its children from the registry."""
+        frame = self.frames.get(frame_id)
+        if not frame:
+            return
+        
+        children = self.children.get(frame_id, [])
+        for child_id in children[:]:
+            self.remove_frame(child_id)
+        
+        if frame.parent_frame_id and frame.parent_frame_id in self.children:
+            if frame_id in self.children[frame.parent_frame_id]:
+                self.children[frame.parent_frame_id].remove(frame_id)
+        
+        if frame_id in self.children:
+            del self.children[frame_id]
+        
+        del self.frames[frame_id]

@@ -119,6 +119,7 @@ class CDPClient:
         """Handle CDP events."""
         method = data.get("method", "")
         params = data.get("params", {})
+        session_id = data.get("sessionId")  # Events from sessions include this
         
         if method == "Target.attachedToTarget":
             session_id = params.get("sessionId")
@@ -165,6 +166,77 @@ class CDPClient:
                 target = self.registry.get_target(target_id)
                 if target and target.session_id:
                     self.registry.mark_session_disconnected(target.session_id)
+        elif method == "Page.frameAttached":
+            frame_id = params.get("frameId")
+            parent_frame_id = params.get("parentFrameId")
+            
+            if not frame_id:
+                return
+            
+            parent_frame = self.registry.get_frame(parent_frame_id) if parent_frame_id else None
+            
+            if parent_frame:
+                target_id = parent_frame.target_id
+                frame_session_id = parent_frame.session_id or session_id
+            else:
+                target_id = None
+                frame_session_id = session_id or self.registry.get_active_session()
+            
+            self.registry.add_frame(
+                frame_id=frame_id,
+                parent_frame_id=parent_frame_id,
+                url="",
+                origin="",
+                target_id=target_id,
+                session_id=frame_session_id
+            )
+        
+        elif method == "Page.frameNavigated":
+            frame_data = params.get("frame")
+            if not frame_data:
+                return
+            
+            frame_id = frame_data.get("id")
+            url = frame_data.get("url", "")
+            origin = frame_data.get("securityOrigin", "")
+            
+            if not frame_id:
+                return
+            
+            frame = self.registry.get_frame(frame_id)
+            if frame:
+                frame.url = url
+                frame.origin = origin
+                
+                if frame.parent_frame_id:
+                    parent = self.registry.get_frame(frame.parent_frame_id)
+                    if parent and origin != parent.origin and origin:
+                        target = self.registry.find_target_by_origin(origin)
+                        if target and target.session_id:
+                            frame.target_id = target.target_id
+                            frame.session_id = target.session_id
+            else:
+                parent_frame_id = None
+                frame_session_id = session_id or self.registry.get_active_session()
+                session_info = self.registry.get_session(frame_session_id) if frame_session_id else None
+                target_id = session_info.target_id if session_info else None
+                
+                self.registry.add_frame(
+                    frame_id=frame_id,
+                    parent_frame_id=parent_frame_id,
+                    url=url,
+                    origin=origin,
+                    target_id=target_id,
+                    session_id=frame_session_id
+                )
+        
+        elif method == "Page.frameDetached":
+            frame_id = params.get("frameId")
+            if frame_id:
+                self.registry.remove_frame(frame_id)
+        
+        elif method.startswith("Page."):
+            pass
     
     async def listen(self):
         """Listen for CDP responses and events."""
@@ -182,8 +254,6 @@ class CDPClient:
                             future.set_exception(Exception(f"CDP Error: {data['error']}"))
                         else:
                             future.set_result(data["result"])
-                    else:
-                        print("dup req")
                 elif "method" in data:
                     self._handle_event(data)
                     
@@ -334,8 +404,8 @@ class CDPClient:
             if session_info.status == SessionStatus.ACTIVE:
                 try:
                     await self.get_frame_tree(session_id=session_id)
-                except Exception as e:
-                    print(f"Warning: Failed to get frame tree for session {session_id}: {e}")
+                except Exception:
+                    pass
     def get_session_for_node(self,node:dict)->Optional[str]:
         frame_id = node.get('frameId')
         if not frame_id:
@@ -343,16 +413,54 @@ class CDPClient:
         return self.registry.get_session_from_frame(frame_id)
     async def interact(self,node:EnhancedNode):
         session_id = self.registry.get_session_from_frame(node.frame_id)
+
         self.send("Some Action",{},session_id=session_id)
-async def get_enhanced_elements(url: str) -> list:
+async def test_frame_events():
+    """Test function specifically for frame events."""
+    ws_url = await get_page_ws_url()
+    cdp = CDPClient(ws_url)
+    await cdp.connect()
+    
+    active_session = cdp.registry.get_active_session()
+    if active_session:
+        if not cdp.registry.is_domain_enabled(active_session, "Page"):
+            await cdp.enable_domains(["Page"], active_session)
+    
+    test_url = """data:text/html,
+<!DOCTYPE html>
+<html>
+<head><title>Frame Test</title></head>
+<body>
+    <h1>Frame Events Test</h1>
+    <div id="container"></div>
+    <script>
+        function addIframe() {
+            const iframe = document.createElement('iframe');
+            iframe.src = 'https://example.com';
+            iframe.style.width = '100%';
+            iframe.style.height = '300px';
+            iframe.style.border = '1px solid black';
+            document.getElementById('container').appendChild(iframe);
+        }
+        setTimeout(addIframe, 2000);
+        setTimeout(addIframe, 4000);
+    </script>
+</body>
+</html>
+"""
+    
+    await cdp.send("Page.navigate", {"url": test_url})
+    await asyncio.sleep(10)
+
+async def get_enhanced_elements() -> list:
     """Get enhanced actionable elements from a webpage."""
     ws_url = await get_page_ws_url()
     cdp = CDPClient(ws_url)
     await cdp.connect()
-    await cdp.get_frame_tree()    
+    # await cdp.get_frame_tree()    
     # # Navigate and wait for load
-    # await cdp.send("Page.navigate", {"url": url})
-    # await asyncio.sleep(2)
+    await cdp.send("Page.navigate", {"url": "http://localhost:8000/test_frame_events.html"})
+    await asyncio.sleep(5)  # Wait for page and iframes to load
     
     # # Get raw DOM data
     # dom_data = await get_dom(cdp)
@@ -371,8 +479,11 @@ async def get_enhanced_elements(url: str) -> list:
 
 if __name__ == "__main__":
     async def main():
-        enhanced_nodes =   await get_enhanced_elements("https://enkymarketing.com")
-
+        # Test frame events
+        await test_frame_events()
+        
+        # Or use normal flow:
+        # enhanced_nodes = await get_enhanced_elements()
         # print(f"🎯 Found {len(enhanced_nodes)} actionable elements:")
         # for i, node in enumerate(enhanced_nodes[:5], 1):
         #     print(f"{i}. {node.tag_name.upper()} '{node.ax_name or node.text_content[:30]}'")
