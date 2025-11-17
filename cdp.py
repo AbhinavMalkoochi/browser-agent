@@ -3,7 +3,7 @@ CDP Client - Chrome DevTools Protocol WebSocket client for browser automation.
 """
 import asyncio
 import json
-from typing import Dict, Optional, TYPE_CHECKING
+from typing import Dict, Optional, TYPE_CHECKING, Set, cast
 
 if TYPE_CHECKING:
     from targets import TargetInfo
@@ -35,6 +35,116 @@ class CDPClient:
         self.pending_message: Dict[int, asyncio.Future] = {}
         self.ws = None
         self.registry = SessionManager()
+        self._network_activity: Dict[str, Dict[str, object]] = {}
+        self._frame_load_states: Dict[str, bool] = {}
+        self._frame_last_update: Dict[str, float] = {}
+        self._lifecycle_enabled_sessions: Set[str] = set()
+        self._main_frames: Dict[str, str] = {}
+
+    def _now(self) -> float:
+        return asyncio.get_running_loop().time()
+
+    def _get_network_state(self, session_id: str) -> Dict[str, object]:
+        state = self._network_activity.get(session_id)
+        if state is None:
+            state = {"inflight": set(), "last_activity": self._now()}
+            self._network_activity[session_id] = state
+        return state
+
+    def _mark_frame_loading(self, frame_id: Optional[str]):
+        if not frame_id:
+            return
+        timestamp = self._now()
+        self._frame_load_states[frame_id] = False
+        self._frame_last_update[frame_id] = timestamp
+
+    def _mark_frame_loaded(self, frame_id: Optional[str]):
+        if not frame_id:
+            return
+        timestamp = self._now()
+        self._frame_load_states[frame_id] = True
+        self._frame_last_update[frame_id] = timestamp
+
+    def _clear_frame_tracking(self, frame_id: Optional[str]):
+        if not frame_id:
+            return
+        self._frame_load_states.pop(frame_id, None)
+        self._frame_last_update.pop(frame_id, None)
+
+    def _frames_pending_load(self, session_id: str) -> Set[str]:
+        pending: Set[str] = set()
+        for frame_id, frame in self.registry.frames.items():
+            if frame.session_id != session_id:
+                continue
+            if not self._frame_load_states.get(frame_id):
+                pending.add(frame_id)
+        return pending
+
+    def _are_frames_loaded(self, session_id: str) -> bool:
+        for frame_id, frame in self.registry.frames.items():
+            if frame.session_id != session_id:
+                continue
+            if not self._frame_load_states.get(frame_id):
+                return False
+        return True
+
+    def _is_network_idle(self, session_id: str, idle_threshold: float, now: float) -> bool:
+        state = self._network_activity.get(session_id)
+        if not state:
+            return True
+        inflight = cast(Set[str], state["inflight"])
+        if inflight:
+            return False
+        last_activity = cast(float, state["last_activity"])
+        return now - last_activity >= idle_threshold
+
+    def _handle_request_will_be_sent(self, session_id: str, params: Dict[str, object]):
+        state = self._get_network_state(session_id)
+        request_id = params.get("requestId")
+        if request_id:
+            inflight = cast(Set[str], state["inflight"])
+            inflight.add(str(request_id))
+        state["last_activity"] = self._now()
+
+    def _handle_request_finished(self, session_id: str, params: Dict[str, object]):
+        state = self._get_network_state(session_id)
+        request_id = params.get("requestId")
+        if request_id:
+            inflight = cast(Set[str], state["inflight"])
+            inflight.discard(str(request_id))
+        state["last_activity"] = self._now()
+
+    async def _prepare_for_load_wait(self, session_id: str):
+        if not self.registry.is_domain_enabled(session_id, "Page"):
+            await self.enable_domains(["Page"], session_id)
+        if not self.registry.is_domain_enabled(session_id, "Network"):
+            await self.enable_domains(["Network"], session_id)
+        if session_id not in self._lifecycle_enabled_sessions:
+            try:
+                await self.send("Page.setLifecycleEventsEnabled", {"enabled": True}, session_id=session_id)
+            except Exception:
+                pass
+            else:
+                self._lifecycle_enabled_sessions.add(session_id)
+        state = self._get_network_state(session_id)
+        inflight = cast(Set[str], state["inflight"])
+        inflight.clear()
+        state["last_activity"] = self._now()
+        for frame_id, frame in self.registry.frames.items():
+            if frame.session_id == session_id:
+                self._mark_frame_loading(frame_id)
+
+    async def _is_document_ready(self, session_id: str) -> bool:
+        result = await self.send(
+            "Runtime.evaluate",
+            {"expression": "document.readyState", "returnByValue": True},
+            session_id=session_id,
+        )
+        ready_state = result.get("result", {}).get("value")
+        if isinstance(ready_state, str):
+            return ready_state == "complete"
+        return False
+
     async def connect(self):
         """Connect to Chrome via WebSocket."""
         self.ws = await connect(self.ws_url)
@@ -190,6 +300,8 @@ class CDPClient:
                 target_id=target_id,
                 session_id=frame_session_id
             )
+            
+            self._mark_frame_loading(frame_id)
         
         elif method == "Page.frameNavigated":
             frame_data = params.get("frame")
@@ -202,6 +314,10 @@ class CDPClient:
             
             if not frame_id:
                 return
+            
+            if session_id and not frame_data.get("parentId"):
+                self._main_frames[session_id] = frame_id
+            self._mark_frame_loading(frame_id)
             
             frame = self.registry.get_frame(frame_id)
             if frame:
@@ -233,7 +349,28 @@ class CDPClient:
         elif method == "Page.frameDetached":
             frame_id = params.get("frameId")
             if frame_id:
+                self._clear_frame_tracking(frame_id)
                 self.registry.remove_frame(frame_id)
+        
+        elif method == "Page.frameStartedLoading":
+            frame_id = params.get("frameId")
+            self._mark_frame_loading(frame_id)
+        
+        elif method == "Page.frameStoppedLoading":
+            frame_id = params.get("frameId")
+            self._mark_frame_loaded(frame_id)
+        
+        elif method == "Page.loadEventFired":
+            if session_id and session_id in self._main_frames:
+                self._mark_frame_loaded(self._main_frames[session_id])
+        
+        elif method == "Network.requestWillBeSent":
+            if session_id:
+                self._handle_request_will_be_sent(session_id, params)
+        
+        elif method in ("Network.loadingFinished", "Network.loadingFailed"):
+            if session_id:
+                self._handle_request_finished(session_id, params)
         
         elif method.startswith("Page."):
             pass
@@ -392,7 +529,49 @@ class CDPClient:
                         self.registry.update_frame_target_mapping(frame_id, target_id, session_id)
                     else:
                         frame.target_id = target_id
-    
+    async def wait_for_load(
+        self,
+        session_id: Optional[str] = None,
+        timeout: float = 15.0,
+        network_idle_threshold: float = 0.5,
+        check_interval: float = 0.1,
+    ):
+        if session_id is None:
+            session_id = self.registry.get_active_session()
+        if session_id is None:
+            raise RuntimeError("No active session available")
+
+        await self._prepare_for_load_wait(session_id)
+
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        ready_state_complete = False
+
+        while True:
+            now = loop.time()
+            if now >= deadline:
+                state = self._get_network_state(session_id)
+                inflight = len(cast(Set[str], state["inflight"]))
+                pending_frames = list(self._frames_pending_load(session_id))
+                raise TimeoutError(
+                    f"Page load timed out after {timeout} seconds "
+                    f"(pending_frames={pending_frames}, inflight_requests={inflight})"
+                )
+
+            if not ready_state_complete:
+                try:
+                    ready_state_complete = await self._is_document_ready(session_id)
+                except Exception:
+                    ready_state_complete = False
+
+            network_idle = self._is_network_idle(session_id, network_idle_threshold, now)
+            frames_loaded = self._are_frames_loaded(session_id)
+
+            if ready_state_complete and network_idle and frames_loaded:
+                return
+
+            await asyncio.sleep(check_interval)
+            
     async def collect_all_frame_trees(self):
         """
         Collect frame trees from all active sessions.
@@ -450,7 +629,7 @@ async def test_frame_events():
 """
     
     await cdp.send("Page.navigate", {"url": test_url})
-    await asyncio.sleep(10)
+    await cdp.wait_for_load(session_id=active_session, timeout=15.0)
 
 async def get_enhanced_elements() -> list:
     """Get enhanced actionable elements from a webpage."""
@@ -460,7 +639,7 @@ async def get_enhanced_elements() -> list:
     # await cdp.get_frame_tree()    
     # # Navigate and wait for load
     await cdp.send("Page.navigate", {"url": "http://localhost:8000/test_frame_events.html"})
-    await asyncio.sleep(5)  # Wait for page and iframes to load
+    await cdp.wait_for_load(timeout=15.0)
     
     # # Get raw DOM data
     # dom_data = await get_dom(cdp)
