@@ -1,8 +1,5 @@
 """
 Enhanced Node Merger - Transforms raw CDP data into actionable browser elements.
-
-This module correlates DOM, DOMSnapshot, and Accessibility data to identify
-interactive elements suitable for browser automation.
 """
 
 from dataclasses import dataclass
@@ -13,7 +10,7 @@ class EnhancedNode:
     """Unified representation of a browser element with action metadata."""
     backend_node_id: int
     tag_name: str
-    bounds_css: Tuple[float, float, float, float]
+    bounds_css: Tuple[float, float, float, float]  # x, y, width, height
     click_point: Tuple[float, float]
     attributes: Dict[str, str]
     text_content: str
@@ -24,12 +21,12 @@ class EnhancedNode:
     is_interactive: bool
     is_clickable: bool
     is_focusable: bool
+    is_occluded: bool  # New field for occlusion
     computed_styles: Dict[str, str]
     paint_order: int
     action_type: str
     confidence_score: float
-    frame_id: Optional[str]=None
-
+    frame_id: Optional[str] = None
 
 class BrowserDataMerger:
     """Merges DOM, DOMSnapshot, and Accessibility data into enhanced nodes."""
@@ -44,130 +41,145 @@ class BrowserDataMerger:
         dpr = self._calculate_dpr(metrics_data)
         self._update_viewport_from_metrics(metrics_data)
         
+        # 1. Build Lookups
         snapshot_lookup = self._build_snapshot_lookup(snapshot_data, dpr)
         ax_lookup = self._build_ax_lookup(ax_data)
         
+        # 2. Traverse and Create Nodes
         enhanced_nodes = []
-        self._traverse_dom_and_merge(
-            dom_data['root'], 
-            snapshot_lookup, 
-            ax_lookup, 
-            enhanced_nodes
-        )
+        if 'root' in dom_data:
+            self._traverse_dom_and_merge(
+                dom_data['root'], 
+                snapshot_lookup, 
+                ax_lookup, 
+                enhanced_nodes
+            )
         
+        # 3. Apply Occlusion Detection (Z-Index/Paint Order check)
+        self._apply_occlusion_detection(enhanced_nodes)
+        
+        # 4. Filter and Sort
         return self._filter_actionable_elements(enhanced_nodes)
     
     def _calculate_dpr(self, metrics_data: dict) -> float:
-        """Calculate device pixel ratio from metrics."""
         visual_viewport = metrics_data.get('visualViewport', {})
         css_viewport = metrics_data.get('cssVisualViewport', {})
-        
         visual_width = visual_viewport.get('clientWidth', 1)
         css_width = css_viewport.get('clientWidth', 1)
-        
         return visual_width / css_width if css_width > 0 else 1.0
     
     def _update_viewport_from_metrics(self, metrics_data: dict):
-        """Update viewport dimensions from actual metrics."""
         css_viewport = metrics_data.get('cssVisualViewport', {})
         self.viewport_width = css_viewport.get('clientWidth', self.viewport_width)
         self.viewport_height = css_viewport.get('clientHeight', self.viewport_height)
     
     def _build_snapshot_lookup(self, snapshot_data: dict, dpr: float) -> Dict[int, dict]:
-        """Build a lookup table: backend_node_id -> snapshot data."""
+        """
+        Build a lookup table: backend_node_id -> snapshot data.
+        FIX: Iterates over ALL documents (main frame + iframes) in the snapshot.
+        """
         lookup = {}
-        
-        if not snapshot_data.get('documents'):
-            return lookup
-            
-        doc = snapshot_data['documents'][0]
-        nodes = doc.get('nodes', {})
-        layout = doc.get('layout', {})
-        
-        backend_ids = nodes.get('backendNodeId', [])
-        node_types = nodes.get('nodeType', [])
-        node_names = nodes.get('nodeName', [])
-        
-        bounds = layout.get('bounds', [])
-        styles = layout.get('styles', [])
-        paint_orders = layout.get('paintOrders', [])
-        
         strings = snapshot_data.get('strings', [])
         
-        for i, backend_id in enumerate(backend_ids):
-            if backend_id and i < len(bounds):
-                device_bounds = bounds[i]
-                css_bounds = [coord / dpr for coord in device_bounds]
-                
-                node_name = ""
-                if i < len(node_names) and 0 <= node_names[i] < len(strings):
-                    node_name = strings[node_names[i]]
-                
-                computed_styles = {}
-                if i < len(styles):
-                    style_indices = styles[i]
-                    for j in range(0, len(style_indices), 2):
-                        if j + 1 < len(style_indices):
-                            prop_idx = style_indices[j]
-                            val_idx = style_indices[j + 1]
-                            if (0 <= prop_idx < len(strings) and 
-                                0 <= val_idx < len(strings)):
-                                computed_styles[strings[prop_idx]] = strings[val_idx]
-                
-                lookup[backend_id] = {
-                    'bounds_css': css_bounds,
-                    'node_type': node_types[i] if i < len(node_types) else 0,
-                    'node_name': node_name,
-                    'computed_styles': computed_styles,
-                    'paint_order': paint_orders[i] if i < len(paint_orders) else 0
-                }
+        # Iterate over all documents (Main frame is index 0, iframes are subsequent)
+        documents = snapshot_data.get('documents', [])
+        
+        for doc in documents:
+            nodes = doc.get('nodes', {})
+            layout = doc.get('layout', {})
+            
+            backend_ids = nodes.get('backendNodeId', [])
+            node_types = nodes.get('nodeType', [])
+            node_names = nodes.get('nodeName', [])
+            
+            bounds = layout.get('bounds', [])
+            styles = layout.get('styles', [])
+            paint_orders = layout.get('paintOrders', [])
+            
+            for i, backend_id in enumerate(backend_ids):
+                if backend_id and i < len(bounds):
+                    # CDP Snapshot bounds are usually viewport-relative already
+                    device_bounds = bounds[i]
+                    css_bounds = [coord / dpr for coord in device_bounds]
+                    
+                    node_name = ""
+                    if i < len(node_names) and 0 <= node_names[i] < len(strings):
+                        node_name = strings[node_names[i]]
+                    
+                    computed_styles = {}
+                    if i < len(styles):
+                        style_indices = styles[i]
+                        for j in range(0, len(style_indices), 2):
+                            if j + 1 < len(style_indices):
+                                prop_idx = style_indices[j]
+                                val_idx = style_indices[j + 1]
+                                if (0 <= prop_idx < len(strings) and 
+                                    0 <= val_idx < len(strings)):
+                                    computed_styles[strings[prop_idx]] = strings[val_idx]
+                    
+                    lookup[backend_id] = {
+                        'bounds_css': css_bounds,
+                        'node_type': node_types[i] if i < len(node_types) else 0,
+                        'node_name': node_name,
+                        'computed_styles': computed_styles,
+                        'paint_order': paint_orders[i] if i < len(paint_orders) else 0
+                    }
         
         return lookup
     
     def _build_ax_lookup(self, ax_data: dict) -> Dict[int, dict]:
-        """Build a lookup table: backend_node_id -> accessibility data."""
         lookup = {}
-        
         for node in ax_data.get('nodes', []):
             backend_id = node.get('backendDOMNodeId')
             if backend_id:
                 role = node.get('role', {}).get('value', '')
                 name = node.get('name', {}).get('value', '')
-                
                 properties = {}
                 for prop in node.get('properties', []):
                     prop_name = prop.get('name')
                     prop_value = prop.get('value', {}).get('value')
                     if prop_name and prop_value is not None:
                         properties[prop_name] = prop_value
-                
                 lookup[backend_id] = {
                     'role': role,
                     'name': name,
                     'properties': properties
                 }
-        
         return lookup
     
     def _traverse_dom_and_merge(self, node: dict, snapshot_lookup: dict, 
-                               ax_lookup: dict, enhanced_nodes: list):
+                               ax_lookup: dict, enhanced_nodes: list, frame_id: str = None):
         """Recursively traverse DOM tree and merge with snapshot/AX data."""
+        
+        # Update frame_id if we encounter a frame owner
+        if node.get('frameId'):
+            frame_id = node.get('frameId')
+
         node_type = node.get('nodeType', 0)
         
-        if node_type == 1:
+        if node_type == 1: # Element node
             backend_id = node.get('backendNodeId')
             if backend_id and backend_id in snapshot_lookup:
                 enhanced_node = self._create_enhanced_node(
-                    node, snapshot_lookup[backend_id], ax_lookup.get(backend_id, {})
+                    node, snapshot_lookup[backend_id], ax_lookup.get(backend_id, {}), frame_id
                 )
                 if enhanced_node:
                     enhanced_nodes.append(enhanced_node)
         
+        # Recurse children
         for child in node.get('children', []):
-            self._traverse_dom_and_merge(child, snapshot_lookup, ax_lookup, enhanced_nodes)
-    
-    def _create_enhanced_node(self, dom_node: dict, snapshot_data: dict, ax_data: dict) -> Optional[EnhancedNode]:
-        """Create an enhanced node from merged data sources."""
+            self._traverse_dom_and_merge(child, snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
+            
+        # Handle contentDocument (Iframes/Frames)
+        if 'contentDocument' in node:
+            self._traverse_dom_and_merge(node['contentDocument'], snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
+        
+        # Handle Shadow Roots
+        if 'shadowRoots' in node:
+            for root in node['shadowRoots']:
+                self._traverse_dom_and_merge(root, snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
+
+    def _create_enhanced_node(self, dom_node: dict, snapshot_data: dict, ax_data: dict, frame_id: str) -> Optional[EnhancedNode]:
         backend_id = dom_node.get('backendNodeId')
         tag_name = dom_node.get('nodeName', '').lower()
         
@@ -208,38 +220,78 @@ class BrowserDataMerger:
             is_interactive=is_interactive,
             is_clickable=is_clickable,
             is_focusable=is_focusable,
+            is_occluded=False, # Will be calculated later
             computed_styles=computed_styles,
             paint_order=snapshot_data.get('paint_order', 0),
             action_type=action_type,
-            confidence_score=confidence_score
+            confidence_score=confidence_score,
+            frame_id=frame_id
         )
-    
-    def _extract_text_content(self, dom_node: dict) -> str:
-        """Extract text content from DOM node and its children."""
-        text_parts = []
+
+    def _apply_occlusion_detection(self, nodes: List[EnhancedNode]):
+        """
+        Detects if elements are covered by other elements using Paint Order.
+        This is an O(N^2) operation on the node list, but N is usually small (<500).
+        """
+        # Sort by paint order descending (top-most elements first)
+        # We only care about visible elements for occlusion logic
+        visible_nodes = [n for n in nodes if n.is_visible and n.bounds_css[2] > 0 and n.bounds_css[3] > 0]
         
+        # Sort so we can iterate efficiently. 
+        # Higher paint_order means it is drawn ON TOP.
+        sorted_by_paint = sorted(visible_nodes, key=lambda x: x.paint_order, reverse=True)
+        
+        for target_node in nodes:
+            if not target_node.is_visible:
+                continue
+                
+            tx, ty = target_node.click_point
+            
+            # Check against all nodes that are painted AFTER (on top of) the target
+            for obstacle in sorted_by_paint:
+                # If we reached the target node itself or a layer below it, stop checking
+                if obstacle.paint_order <= target_node.paint_order:
+                    break
+                
+                # Don't let a parent occlude its own child (common in DOM structures)
+                # In a flat list, this is hard to detect perfectly without tree traversal,
+                # but usually parents have LOWER paint order than children.
+                # If a separate element (like a modal) covers it, it will have higher paint order.
+                
+                ox, oy, owidth, oheight = obstacle.bounds_css
+                
+                # Check if target's center point is inside the obstacle
+                if (ox <= tx <= ox + owidth) and (oy <= ty <= oy + oheight):
+                    # It is covered.
+                    target_node.is_occluded = True
+                    target_node.is_clickable = False # Force unclickable
+                    target_node.confidence_score *= 0.1 # Heavily penalize
+                    break
+
+    def _extract_text_content(self, dom_node: dict) -> str:
+        text_parts = []
         def collect_text(node):
             if node.get('nodeType') == 3:
                 text = node.get('nodeValue', '').strip()
                 if text:
                     text_parts.append(text)
-            
             for child in node.get('children', []):
                 collect_text(child)
-        
         collect_text(dom_node)
         return ' '.join(text_parts)
     
     def _is_element_visible(self, bounds_css: list, computed_styles: dict) -> bool:
-        """Determine if element is visible based on bounds and CSS properties."""
         x, y, width, height = bounds_css
         
-        if width <= 0 or height <= 0:
+        if width < 1 or height < 1: # Stricter size check
             return False
         
-        if x > self.viewport_width + 100 or y > self.viewport_height + 100:
+        # Check if completely off-screen
+        if x > self.viewport_width or y > self.viewport_height:
             return False
-        
+        if x + width < 0 or y + height < 0:
+            return False
+            
         display = computed_styles.get('display', '')
         visibility = computed_styles.get('visibility', '')
         opacity = computed_styles.get('opacity', '1')
@@ -256,7 +308,6 @@ class BrowserDataMerger:
         return True
     
     def _is_element_interactive(self, tag_name: str, attributes: dict, ax_data: dict) -> bool:
-        """Determine if element is interactive based on multiple signals."""
         interactive_tags = {'button', 'a', 'input', 'select', 'textarea', 'details', 'summary'}
         if tag_name in interactive_tags:
             return True
@@ -280,7 +331,6 @@ class BrowserDataMerger:
         return False
     
     def _is_element_clickable(self, tag_name: str, attributes: dict, ax_data: dict, computed_styles: dict) -> bool:
-        """Determine if element is clickable (subset of interactive)."""
         if not self._is_element_interactive(tag_name, attributes, ax_data):
             return False
         
@@ -308,7 +358,6 @@ class BrowserDataMerger:
         return True
     
     def _determine_action_type(self, tag_name: str, attributes: dict, ax_data: dict) -> str:
-        """Determine what type of action this element supports."""
         if tag_name == 'input':
             input_type = attributes.get('type', 'text').lower()
             if input_type in {'text', 'email', 'password', 'search', 'url', 'tel'}:
@@ -336,7 +385,6 @@ class BrowserDataMerger:
     
     def _calculate_confidence_score(self, is_visible: bool, is_interactive: bool, 
                                   ax_data: dict, bounds_css: list) -> float:
-        """Calculate confidence score (0-1) for how actionable this element is."""
         score = 0.0
         
         if is_visible:
@@ -360,11 +408,14 @@ class BrowserDataMerger:
         return max(0.0, min(1.0, score))
     
     def _filter_actionable_elements(self, enhanced_nodes: List[EnhancedNode]) -> List[EnhancedNode]:
-        """Filter enhanced nodes to only actionable elements."""
         actionable = []
         
         for node in enhanced_nodes:
-            if not node.is_visible or not node.is_interactive:
+            # Filter out occluded or invisible nodes
+            if not node.is_visible or node.is_occluded:
+                continue
+            
+            if not node.is_interactive:
                 continue
             
             if node.confidence_score < 0.3:
@@ -378,4 +429,3 @@ class BrowserDataMerger:
         
         actionable.sort(key=lambda x: x.confidence_score, reverse=True)
         return actionable
-
