@@ -4,17 +4,14 @@ CDP Client - Chrome DevTools Protocol WebSocket client for browser automation.
 import asyncio
 import json
 import logging
-import traceback
-from typing import Dict, Optional, TYPE_CHECKING, Set, cast, Callable, Any, Tuple
+from typing import Dict, Optional, Set, cast, Callable, Any
 
-if TYPE_CHECKING:
-    from targets import TargetInfo
+
 import httpx
 import websockets
 from websockets.asyncio.client import connect
 
-from dom.main import get_dom
-from enhanced_merger import BrowserDataMerger, EnhancedNode
+from enhanced_merger import  EnhancedNode
 from targets import SessionManager, SessionStatus
 from errors import (
     BrowserAgentError,
@@ -1097,7 +1094,6 @@ class CDPClient:
         session_id = self.registry.get_session_from_frame(node.frame_id)
 
         self.send("Some Action",{},session_id=session_id)
-    async def click(node:dict)->Optional[str]:
         
 async def test_frame_events():
     """Test function specifically for frame events."""
