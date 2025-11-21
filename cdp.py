@@ -1085,6 +1085,131 @@ class CDPClient:
             },
             session_id=resolved_session_id,
         )
+
+    async def type_text(
+        self,
+        node: EnhancedNode,
+        text: str,
+        *,
+        clear_existing: bool = False,
+        click_to_focus: bool = True,
+        delay_between_chars: float = 0.0,
+        session_id: Optional[str] = None,
+    ):
+        """
+        Type the provided text into the supplied EnhancedNode.
+
+        Args:
+            node: EnhancedNode representing an input-capable element.
+            text: Text content to insert.
+            clear_existing: If True, clears existing value before typing.
+            click_to_focus: If True, click the element to ensure focus.
+            delay_between_chars: Optional delay between characters (seconds).
+            session_id: Optional explicit session override.
+        """
+        if not isinstance(node, EnhancedNode):
+            raise ValueError("type_text requires an EnhancedNode instance")
+
+        if text is None:
+            raise ValueError("type_text received None for text argument")
+
+        backend_node_id = getattr(node, "backend_node_id", None)
+        if backend_node_id is None:
+            raise ValueError("EnhancedNode is missing backend_node_id required for typing")
+
+        resolved_session_id = session_id or self.registry.get_session_from_frame(node.frame_id)
+        resolved_session_id = await self._ensure_session_active(resolved_session_id)
+
+        if click_to_focus:
+            await self.click_node(
+                node,
+                button="left",
+                click_count=1,
+                move_before_click=False,
+                scroll_into_view=True,
+                delay_between_events=0.0,
+                session_id=resolved_session_id,
+            )
+
+        try:
+            await self.send(
+                "DOM.focus",
+                {"backendNodeId": backend_node_id},
+                session_id=resolved_session_id,
+            )
+        except BrowserAgentError as exc:
+            logger.debug(
+                "Failed to focus node before typing",
+                extra={
+                    "session_id": resolved_session_id,
+                    "backend_node_id": backend_node_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+        object_id: Optional[str] = None
+        try:
+            resolved = await self.send(
+                "DOM.resolveNode",
+                {"backendNodeId": backend_node_id},
+                session_id=resolved_session_id,
+            )
+            object_id = resolved.get("object", {}).get("objectId")
+        except BrowserAgentError as exc:
+            logger.debug(
+                "DOM.resolveNode failed, continuing without objectId",
+                extra={
+                    "session_id": resolved_session_id,
+                    "backend_node_id": backend_node_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+        if clear_existing and object_id:
+            try:
+                await self.send(
+                    "Runtime.callFunctionOn",
+                    {
+                        "objectId": object_id,
+                        "functionDeclaration": """
+                            function() {
+                                if (this instanceof HTMLInputElement || this instanceof HTMLTextAreaElement) {
+                                    this.value = '';
+                                    this.dispatchEvent(new Event('input', { bubbles: true }));
+                                    this.dispatchEvent(new Event('change', { bubbles: true }));
+                                } else {
+                                    this.textContent = '';
+                                }
+                            }
+                        """,
+                        "awaitPromise": False,
+                    },
+                    session_id=resolved_session_id,
+                )
+            except BrowserAgentError as exc:
+                logger.debug(
+                    "Failed to clear existing text before typing",
+                    extra={
+                        "session_id": resolved_session_id,
+                        "backend_node_id": backend_node_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+
+        if delay_between_chars > 0:
+            for char in text:
+                await self.send(
+                    "Input.insertText",
+                    {"text": char},
+                    session_id=resolved_session_id,
+                )
+                await asyncio.sleep(delay_between_chars)
+        else:
+            await self.send(
+                "Input.insertText",
+                {"text": text},
+                session_id=resolved_session_id,
+            )
     def get_session_for_node(self,node:dict)->Optional[str]:
         frame_id = node.get('frameId')
         if not frame_id:
