@@ -992,6 +992,102 @@ class CDPClient:
                         extra={"session_id": session_id},
                         exc_info=True
                     )
+
+    async def click_node(
+        self,
+        node: EnhancedNode,
+        *,
+        button: str = "left",
+        click_count: int = 1,
+        move_before_click: bool = True,
+        scroll_into_view: bool = True,
+        delay_between_events: float = 0.05,
+        session_id: Optional[str] = None,
+    ):
+        """
+        Dispatch a mouse click against the supplied EnhancedNode.
+
+        Args:
+            node: EnhancedNode with click metadata.
+            button: Mouse button to use (left, right, middle).
+            click_count: Number of clicks to report (1 for single, 2 for double).
+            move_before_click: If True, send a mouseMoved event first.
+            scroll_into_view: If True, attempt to scroll the node into view.
+            delay_between_events: Seconds to wait between press/release.
+            session_id: Optional explicit session override.
+        """
+        if not isinstance(node, EnhancedNode):
+            raise ValueError("click_node requires an EnhancedNode instance")
+
+        backend_node_id = getattr(node, "backend_node_id", None)
+        if backend_node_id is None:
+            raise ValueError("EnhancedNode is missing backend_node_id required for click")
+
+        # Resolve the session for the node's frame; fall back to provided session or active session.
+        resolved_session_id = session_id or self.registry.get_session_from_frame(node.frame_id)
+        resolved_session_id = await self._ensure_session_active(resolved_session_id)
+
+        if scroll_into_view:
+            try:
+                await self.send(
+                    "DOM.scrollIntoViewIfNeeded",
+                    {"backendNodeId": backend_node_id},
+                    session_id=resolved_session_id,
+                )
+            except BrowserAgentError as exc:
+                logger.debug(
+                    "scrollIntoViewIfNeeded failed, continuing with click",
+                    extra={
+                        "session_id": resolved_session_id,
+                        "backend_node_id": backend_node_id,
+                        "error_type": type(exc).__name__,
+                    },
+                )
+
+        x, y = node.click_point
+        x_float = float(x)
+        y_float = float(y)
+
+        if move_before_click:
+            await self.send(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseMoved",
+                    "x": x_float,
+                    "y": y_float,
+                    "modifiers": 0,
+                },
+                session_id=resolved_session_id,
+            )
+
+        await self.send(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mousePressed",
+                "x": x_float,
+                "y": y_float,
+                "button": button,
+                "clickCount": click_count,
+                "modifiers": 0,
+            },
+            session_id=resolved_session_id,
+        )
+
+        if delay_between_events > 0:
+            await asyncio.sleep(delay_between_events)
+
+        await self.send(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mouseReleased",
+                "x": x_float,
+                "y": y_float,
+                "button": button,
+                "clickCount": click_count,
+                "modifiers": 0,
+            },
+            session_id=resolved_session_id,
+        )
     def get_session_for_node(self,node:dict)->Optional[str]:
         frame_id = node.get('frameId')
         if not frame_id:
@@ -1001,6 +1097,8 @@ class CDPClient:
         session_id = self.registry.get_session_from_frame(node.frame_id)
 
         self.send("Some Action",{},session_id=session_id)
+    async def click(node:dict)->Optional[str]:
+        
 async def test_frame_events():
     """Test function specifically for frame events."""
     ws_url = await get_page_ws_url()
