@@ -25,6 +25,7 @@ Low-level tool execution:
 """
 from agent import Agent, AgentConfig, DummyLLMBackend, LLMBackend, LLMResponse, ToolCall
 from browser import Browser, BrowserConfig
+from llm_backends import AnthropicBackend, GeminiBackend, OpenAIBackend, create_backend
 from models import ActionResult, AgentHistory, AgentStep, BrowserState
 from serialization import SelectorEntry, SerializedOutput, serialize_dom
 from tools import (
@@ -49,6 +50,11 @@ __all__ = [
     "LLMResponse",
     "ToolCall",
     "DummyLLMBackend",
+    # LLM Backends
+    "OpenAIBackend",
+    "AnthropicBackend",
+    "GeminiBackend",
+    "create_backend",
     # Action results
     "ActionResult",
     "AgentStep",
