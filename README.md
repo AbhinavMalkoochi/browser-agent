@@ -26,17 +26,21 @@ A high-performance browser automation library using Chrome DevTools Protocol (CD
 git clone <your-repo-url>
 cd browser-agent
 
-# Install dependencies (using uv)
+# Install base dependencies (using uv)
 uv sync
 
-# Or with pip
-pip install -e .
+# Install with LLM backend support (choose one or more)
+uv sync --extra openai      # For OpenAI
+uv sync --extra anthropic   # For Anthropic
+uv sync --extra gemini      # For Google Gemini
+uv sync --extra all-llms    # For all LLM backends
 
-# Install with LLM backend support
-pip install -e ".[openai]"      # For OpenAI
-pip install -e ".[anthropic]"   # For Anthropic
-pip install -e ".[gemini]"      # For Google Gemini
-pip install -e ".[all-llms]"    # For all LLM backends
+# Or with pip
+pip install -e .                  # Base only
+pip install -e ".[openai]"        # With OpenAI
+pip install -e ".[anthropic]"     # With Anthropic
+pip install -e ".[gemini]"        # With Google Gemini
+pip install -e ".[all-llms]"      # With all LLM backends
 ```
 
 ### Launch Chrome
@@ -85,7 +89,7 @@ from browser_agent import Agent, AgentConfig, BrowserConfig, OpenAIBackend
 async def main():
     # Use built-in OpenAI backend (or AnthropicBackend, GeminiBackend)
     backend = OpenAIBackend(model="gpt-4o")
-    
+
     config = AgentConfig(
         max_steps=30,
         verbose=True,

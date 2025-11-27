@@ -5,7 +5,7 @@ This module provides production-ready LLM backends that implement the LLMBackend
 protocol for use with the Agent class.
 
 Usage:
-    from llm_backends import OpenAIBackend, AnthropicBackend, GeminiBackend
+    from browser_agent import OpenAIBackend, AnthropicBackend, GeminiBackend
     
     backend = OpenAIBackend(api_key="sk-...")
     # or
@@ -40,7 +40,7 @@ class OpenAIBackend:
     Uses the openai Python SDK to call GPT-4o or other models with tool calling.
     
     Requirements:
-        pip install openai
+        pip install browser-agent[openai]
     
     Usage:
         backend = OpenAIBackend(api_key="sk-...", model="gpt-4o")
@@ -67,7 +67,7 @@ class OpenAIBackend:
             from openai import AsyncOpenAI
         except ImportError:
             raise ImportError(
-                "OpenAI SDK not installed. Run: pip install openai"
+                "OpenAI SDK not installed. Run: pip install browser-agent[openai]"
             )
         
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -137,7 +137,7 @@ class AnthropicBackend:
     Uses the anthropic Python SDK to call Claude models with tool use.
     
     Requirements:
-        pip install anthropic
+        pip install browser-agent[anthropic]
     
     Usage:
         backend = AnthropicBackend(api_key="sk-ant-...", model="claude-sonnet-4-20250514")
@@ -164,7 +164,7 @@ class AnthropicBackend:
             from anthropic import AsyncAnthropic
         except ImportError:
             raise ImportError(
-                "Anthropic SDK not installed. Run: pip install anthropic"
+                "Anthropic SDK not installed. Run: pip install browser-agent[anthropic]"
             )
         
         self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
@@ -185,24 +185,56 @@ class AnthropicBackend:
         """
         Convert OpenAI-style messages to Anthropic format.
         
+        Handles:
+        - System message concatenation (multiple system messages are joined)
+        - Role alternation (consecutive same-role messages are merged)
+        - Tool results grouping (multiple tool results go into one user message)
+        
         Returns:
             Tuple of (system_prompt, messages)
         """
-        system_prompt = ""
-        anthropic_messages = []
+        system_parts: List[str] = []
+        anthropic_messages: List[Dict[str, Any]] = []
+        
+        # First pass: collect all messages, converting to Anthropic format
+        pending_tool_results: List[Dict[str, Any]] = []
         
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
             
             if role == "system":
-                system_prompt = content or ""
+                # Concatenate all system messages
+                if content:
+                    system_parts.append(content)
+                    
             elif role == "user":
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": content or "",
-                })
+                # Flush any pending tool results first
+                if pending_tool_results:
+                    self._append_or_merge(
+                        anthropic_messages,
+                        "user",
+                        pending_tool_results.copy()
+                    )
+                    pending_tool_results.clear()
+                
+                # Add user message
+                self._append_or_merge(
+                    anthropic_messages,
+                    "user",
+                    [{"type": "text", "text": content or ""}]
+                )
+                    
             elif role == "assistant":
+                # Flush any pending tool results first
+                if pending_tool_results:
+                    self._append_or_merge(
+                        anthropic_messages,
+                        "user",
+                        pending_tool_results.copy()
+                    )
+                    pending_tool_results.clear()
+                
                 # Handle assistant messages with tool calls
                 if msg.get("tool_calls"):
                     content_blocks = []
@@ -225,27 +257,75 @@ class AnthropicBackend:
                             "input": args,
                         })
                     
-                    anthropic_messages.append({
-                        "role": "assistant",
-                        "content": content_blocks,
-                    })
+                    self._append_or_merge(
+                        anthropic_messages,
+                        "assistant",
+                        content_blocks
+                    )
                 else:
-                    anthropic_messages.append({
-                        "role": "assistant",
-                        "content": content or "",
-                    })
+                    self._append_or_merge(
+                        anthropic_messages,
+                        "assistant",
+                        [{"type": "text", "text": content or ""}]
+                    )
+                    
             elif role == "tool":
-                # Tool results in Anthropic format
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": msg.get("tool_call_id"),
-                        "content": content or "",
-                    }],
+                # Collect tool results - they'll be flushed as a single user message
+                pending_tool_results.append({
+                    "type": "tool_result",
+                    "tool_use_id": msg.get("tool_call_id"),
+                    "content": content or "",
                 })
         
+        # Flush any remaining tool results
+        if pending_tool_results:
+            self._append_or_merge(
+                anthropic_messages,
+                "user",
+                pending_tool_results
+            )
+        
+        # Join system prompts with newlines
+        system_prompt = "\n\n".join(system_parts)
+        
         return system_prompt, anthropic_messages
+    
+    def _append_or_merge(
+        self,
+        messages: List[Dict[str, Any]],
+        role: str,
+        content_blocks: List[Dict[str, Any]],
+    ) -> None:
+        """
+        Append content to messages, merging with previous message if same role.
+        
+        This ensures Anthropic's alternating role requirement is satisfied.
+        """
+        if not content_blocks:
+            return
+            
+        if messages and messages[-1]["role"] == role:
+            # Merge with previous message of same role
+            prev_content = messages[-1]["content"]
+            if isinstance(prev_content, str):
+                # Convert string content to list format
+                prev_content = [{"type": "text", "text": prev_content}]
+            prev_content.extend(content_blocks)
+            messages[-1]["content"] = prev_content
+        else:
+            # Add new message
+            # If only one text block, can use string format
+            if (len(content_blocks) == 1 and 
+                content_blocks[0].get("type") == "text"):
+                messages.append({
+                    "role": role,
+                    "content": content_blocks[0]["text"],
+                })
+            else:
+                messages.append({
+                    "role": role,
+                    "content": content_blocks,
+                })
     
     def _convert_tools_to_anthropic(
         self,
@@ -277,7 +357,7 @@ class AnthropicBackend:
             
             response = await self.client.messages.create(
                 model=self.model,
-                system=system_prompt,
+                system=system_prompt if system_prompt else None,
                 messages=anthropic_messages,
                 tools=anthropic_tools if anthropic_tools else None,
                 max_tokens=self.max_tokens,
@@ -320,7 +400,7 @@ class GeminiBackend:
     Uses the google-genai Python SDK to call Gemini models with function calling.
     
     Requirements:
-        pip install google-genai
+        pip install browser-agent[gemini]
     
     Usage:
         backend = GeminiBackend(api_key="...", model="gemini-2.5-flash")
@@ -350,7 +430,7 @@ class GeminiBackend:
             self._types = types
         except ImportError:
             raise ImportError(
-                "Google GenAI SDK not installed. Run: pip install google-genai"
+                "Google GenAI SDK not installed. Run: pip install browser-agent[gemini]"
             )
         
         self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
@@ -371,25 +451,55 @@ class GeminiBackend:
         """
         Convert OpenAI-style messages to Gemini format.
         
+        Handles:
+        - System message concatenation
+        - Role merging for consecutive same-role messages
+        - Tool response grouping
+        
         Returns:
             Tuple of (system_instruction, contents)
         """
         types = self._types
-        system_instruction = ""
-        contents = []
+        system_parts: List[str] = []
+        contents: List[Any] = []
+        
+        # Track pending tool responses to group them
+        pending_tool_responses: List[Any] = []
+        
+        def flush_tool_responses():
+            """Flush pending tool responses into a single content."""
+            nonlocal pending_tool_responses
+            if pending_tool_responses:
+                self._append_or_merge_gemini(
+                    contents,
+                    "user",  # Tool responses are sent as user role in Gemini
+                    pending_tool_responses.copy()
+                )
+                pending_tool_responses.clear()
         
         for msg in messages:
             role = msg.get("role")
             content = msg.get("content")
             
             if role == "system":
-                system_instruction = content or ""
+                # Concatenate all system messages
+                if content:
+                    system_parts.append(content)
+                    
             elif role == "user":
-                contents.append(types.Content(
-                    role="user",
-                    parts=[types.Part.from_text(text=content or "")],
-                ))
+                # Flush any pending tool responses first
+                flush_tool_responses()
+                
+                self._append_or_merge_gemini(
+                    contents,
+                    "user",
+                    [types.Part.from_text(text=content or "")]
+                )
+                    
             elif role == "assistant":
+                # Flush any pending tool responses first
+                flush_tool_responses()
+                
                 if msg.get("tool_calls"):
                     # Assistant message with tool calls
                     parts = []
@@ -409,27 +519,57 @@ class GeminiBackend:
                             args=args,
                         ))
                     
-                    contents.append(types.Content(role="model", parts=parts))
+                    self._append_or_merge_gemini(contents, "model", parts)
                 else:
-                    contents.append(types.Content(
-                        role="model",
-                        parts=[types.Part.from_text(text=content or "")],
-                    ))
+                    self._append_or_merge_gemini(
+                        contents,
+                        "model",
+                        [types.Part.from_text(text=content or "")]
+                    )
+                    
             elif role == "tool":
-                # Tool response
+                # Collect tool responses - they'll be flushed together
                 tool_call_id = msg.get("tool_call_id", "")
-                # Find the function name from the tool_call_id
+                # Extract function name from tool_call_id
                 func_name = tool_call_id.split("_")[0] if "_" in tool_call_id else "unknown"
                 
-                contents.append(types.Content(
-                    role="tool",
-                    parts=[types.Part.from_function_response(
+                pending_tool_responses.append(
+                    types.Part.from_function_response(
                         name=func_name,
                         response={"result": content},
-                    )],
-                ))
+                    )
+                )
+        
+        # Flush any remaining tool responses
+        flush_tool_responses()
+        
+        # Join system instructions
+        system_instruction = "\n\n".join(system_parts)
         
         return system_instruction, contents
+    
+    def _append_or_merge_gemini(
+        self,
+        contents: List[Any],
+        role: str,
+        parts: List[Any],
+    ) -> None:
+        """
+        Append parts to contents, merging with previous content if same role.
+        """
+        types = self._types
+        
+        if not parts:
+            return
+        
+        if contents and contents[-1].role == role:
+            # Merge with previous content of same role
+            existing_parts = list(contents[-1].parts)
+            existing_parts.extend(parts)
+            contents[-1] = types.Content(role=role, parts=existing_parts)
+        else:
+            # Add new content
+            contents.append(types.Content(role=role, parts=parts))
     
     def _convert_tools_to_gemini(
         self,
@@ -561,4 +701,3 @@ def create_backend(
         raise ValueError(
             f"Unknown provider: {provider}. Use 'openai', 'anthropic', or 'gemini'."
         )
-
