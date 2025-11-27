@@ -4,7 +4,7 @@ CDP Client - Chrome DevTools Protocol WebSocket client for browser automation.
 import asyncio
 import json
 import logging
-from typing import Dict, Optional, Set, cast, Callable, Any
+from typing import Dict, List, Optional, Set, cast, Callable, Any
 
 
 import httpx
@@ -1486,3 +1486,378 @@ class CDPClient:
                 logger.debug(f"Error closing WebSocket: {e}")
             finally:
                 self.ws = None
+
+    # =========================================================================
+    # Select Dropdown Action (Task 2.1)
+    # =========================================================================
+
+    async def select_option(
+        self,
+        node: EnhancedNode,
+        value: str,
+        *,
+        by: str = "value",
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Select an option in a dropdown (<select>) element.
+
+        Args:
+            node: EnhancedNode representing a <select> element.
+            value: The value to select.
+            by: How to match the option - "value" (option value attribute),
+                "text" (visible text), or "index" (0-based index).
+            session_id: Optional explicit session override.
+        """
+        if not isinstance(node, EnhancedNode):
+            raise ValueError("select_option requires an EnhancedNode instance")
+
+        backend_node_id = getattr(node, "backend_node_id", None)
+        if backend_node_id is None:
+            raise ValueError("EnhancedNode is missing backend_node_id required for select")
+
+        resolved_session_id = session_id or self.registry.get_session_from_frame(node.frame_id)
+        resolved_session_id = await self._ensure_session_active(resolved_session_id)
+
+        # Resolve the node to get objectId for JS execution
+        resolved = await self.send(
+            "DOM.resolveNode",
+            {"backendNodeId": backend_node_id},
+            session_id=resolved_session_id,
+        )
+        object_id = resolved.get("object", {}).get("objectId")
+        if not object_id:
+            raise CDPProtocolError(
+                "Failed to resolve select element to objectId",
+                method="select_option"
+            )
+
+        # Build the JS function based on match type
+        if by == "value":
+            js_function = """
+                function(value) {
+                    if (!(this instanceof HTMLSelectElement)) {
+                        throw new Error('Element is not a <select>');
+                    }
+                    for (let i = 0; i < this.options.length; i++) {
+                        if (this.options[i].value === value) {
+                            this.selectedIndex = i;
+                            this.dispatchEvent(new Event('input', { bubbles: true }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                    }
+                    throw new Error('Option with value "' + value + '" not found');
+                }
+            """
+        elif by == "text":
+            js_function = """
+                function(text) {
+                    if (!(this instanceof HTMLSelectElement)) {
+                        throw new Error('Element is not a <select>');
+                    }
+                    for (let i = 0; i < this.options.length; i++) {
+                        if (this.options[i].text === text || this.options[i].textContent.trim() === text) {
+                            this.selectedIndex = i;
+                            this.dispatchEvent(new Event('input', { bubbles: true }));
+                            this.dispatchEvent(new Event('change', { bubbles: true }));
+                            return true;
+                        }
+                    }
+                    throw new Error('Option with text "' + text + '" not found');
+                }
+            """
+        elif by == "index":
+            js_function = """
+                function(indexStr) {
+                    if (!(this instanceof HTMLSelectElement)) {
+                        throw new Error('Element is not a <select>');
+                    }
+                    const index = parseInt(indexStr, 10);
+                    if (index < 0 || index >= this.options.length) {
+                        throw new Error('Index ' + index + ' out of range (0-' + (this.options.length - 1) + ')');
+                    }
+                    this.selectedIndex = index;
+                    this.dispatchEvent(new Event('input', { bubbles: true }));
+                    this.dispatchEvent(new Event('change', { bubbles: true }));
+                    return true;
+                }
+            """
+        else:
+            raise ValueError(f"Invalid 'by' parameter: {by}. Use 'value', 'text', or 'index'.")
+
+        await self.send(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": object_id,
+                "functionDeclaration": js_function,
+                "arguments": [{"value": str(value)}],
+                "awaitPromise": False,
+                "returnByValue": True,
+            },
+            session_id=resolved_session_id,
+        )
+
+    # =========================================================================
+    # Keyboard Actions (Task 2.2)
+    # =========================================================================
+
+    async def press_key(
+        self,
+        key: str,
+        *,
+        modifiers: Optional[List[str]] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Press a keyboard key.
+
+        Args:
+            key: Key to press. Common values: "Enter", "Escape", "Tab", "Backspace",
+                 "Delete", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight",
+                 or single characters like "a", "A", "1", etc.
+            modifiers: List of modifier keys to hold. Options: "ctrl", "alt", "shift", "meta".
+            session_id: Optional explicit session override.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        # Calculate modifier flags
+        modifier_flags = 0
+        if modifiers:
+            modifier_map = {
+                "alt": 1,
+                "ctrl": 2,
+                "control": 2,
+                "meta": 4,
+                "cmd": 4,
+                "command": 4,
+                "shift": 8,
+            }
+            for mod in modifiers:
+                modifier_flags |= modifier_map.get(mod.lower(), 0)
+
+        # Map common key names to CDP key codes
+        key_definitions = {
+            "enter": {"key": "Enter", "code": "Enter", "keyCode": 13},
+            "escape": {"key": "Escape", "code": "Escape", "keyCode": 27},
+            "esc": {"key": "Escape", "code": "Escape", "keyCode": 27},
+            "tab": {"key": "Tab", "code": "Tab", "keyCode": 9},
+            "backspace": {"key": "Backspace", "code": "Backspace", "keyCode": 8},
+            "delete": {"key": "Delete", "code": "Delete", "keyCode": 46},
+            "arrowup": {"key": "ArrowUp", "code": "ArrowUp", "keyCode": 38},
+            "arrowdown": {"key": "ArrowDown", "code": "ArrowDown", "keyCode": 40},
+            "arrowleft": {"key": "ArrowLeft", "code": "ArrowLeft", "keyCode": 37},
+            "arrowright": {"key": "ArrowRight", "code": "ArrowRight", "keyCode": 39},
+            "home": {"key": "Home", "code": "Home", "keyCode": 36},
+            "end": {"key": "End", "code": "End", "keyCode": 35},
+            "pageup": {"key": "PageUp", "code": "PageUp", "keyCode": 33},
+            "pagedown": {"key": "PageDown", "code": "PageDown", "keyCode": 34},
+            "space": {"key": " ", "code": "Space", "keyCode": 32},
+            " ": {"key": " ", "code": "Space", "keyCode": 32},
+        }
+
+        key_lower = key.lower()
+        if key_lower in key_definitions:
+            key_info = key_definitions[key_lower]
+        elif len(key) == 1:
+            # Single character
+            char_code = ord(key)
+            key_info = {
+                "key": key,
+                "code": f"Key{key.upper()}" if key.isalpha() else f"Digit{key}" if key.isdigit() else key,
+                "keyCode": char_code if char_code < 128 else 0,
+            }
+        else:
+            # Pass through as-is for other keys
+            key_info = {"key": key, "code": key, "keyCode": 0}
+
+        # Send keyDown event
+        await self.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyDown",
+                "key": key_info["key"],
+                "code": key_info["code"],
+                "windowsVirtualKeyCode": key_info["keyCode"],
+                "nativeVirtualKeyCode": key_info["keyCode"],
+                "modifiers": modifier_flags,
+            },
+            session_id=resolved_session_id,
+        )
+
+        # For printable characters, also send char event
+        if len(key_info["key"]) == 1 and key_info["key"].isprintable():
+            await self.send(
+                "Input.dispatchKeyEvent",
+                {
+                    "type": "char",
+                    "key": key_info["key"],
+                    "text": key_info["key"],
+                    "modifiers": modifier_flags,
+                },
+                session_id=resolved_session_id,
+            )
+
+        # Send keyUp event
+        await self.send(
+            "Input.dispatchKeyEvent",
+            {
+                "type": "keyUp",
+                "key": key_info["key"],
+                "code": key_info["code"],
+                "windowsVirtualKeyCode": key_info["keyCode"],
+                "nativeVirtualKeyCode": key_info["keyCode"],
+                "modifiers": modifier_flags,
+            },
+            session_id=resolved_session_id,
+        )
+
+    # =========================================================================
+    # Element Highlighting (Task 2.4)
+    # =========================================================================
+
+    async def highlight_node(
+        self,
+        node: EnhancedNode,
+        *,
+        duration_ms: int = 2000,
+        color: str = "rgba(255, 0, 0, 0.3)",
+        outline_color: str = "rgba(255, 0, 0, 0.8)",
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Highlight an element on the page for debugging.
+
+        Args:
+            node: EnhancedNode to highlight.
+            duration_ms: How long to show the highlight (milliseconds).
+            color: Background color for the highlight.
+            outline_color: Outline/border color.
+            session_id: Optional explicit session override.
+        """
+        if not isinstance(node, EnhancedNode):
+            raise ValueError("highlight_node requires an EnhancedNode instance")
+
+        backend_node_id = getattr(node, "backend_node_id", None)
+        if backend_node_id is None:
+            raise ValueError("EnhancedNode is missing backend_node_id required for highlight")
+
+        resolved_session_id = session_id or self.registry.get_session_from_frame(node.frame_id)
+        resolved_session_id = await self._ensure_session_active(resolved_session_id)
+
+        # Use CDP's built-in highlight
+        await self.send(
+            "Overlay.highlightNode",
+            {
+                "highlightConfig": {
+                    "showInfo": True,
+                    "showStyles": False,
+                    "showRulers": False,
+                    "showAccessibilityInfo": True,
+                    "contentColor": {"r": 255, "g": 0, "b": 0, "a": 0.3},
+                    "paddingColor": {"r": 255, "g": 128, "b": 0, "a": 0.3},
+                    "borderColor": {"r": 255, "g": 0, "b": 0, "a": 0.8},
+                    "marginColor": {"r": 128, "g": 128, "b": 0, "a": 0.3},
+                },
+                "backendNodeId": backend_node_id,
+            },
+            session_id=resolved_session_id,
+        )
+
+        # Schedule hide after duration
+        async def hide_highlight():
+            await asyncio.sleep(duration_ms / 1000)
+            try:
+                await self.send(
+                    "Overlay.hideHighlight",
+                    {},
+                    session_id=resolved_session_id,
+                )
+            except BrowserAgentError:
+                pass  # Ignore errors when hiding (page may have navigated)
+
+        asyncio.create_task(hide_highlight())
+
+    # =========================================================================
+    # Occlusion Verification (Task 2.5)
+    # =========================================================================
+
+    async def verify_element_visible(
+        self,
+        node: EnhancedNode,
+        *,
+        session_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Verify that an element is visible and not occluded by another element.
+
+        Args:
+            node: EnhancedNode to verify.
+            session_id: Optional explicit session override.
+
+        Returns:
+            True if the element is visible at its click point, False if occluded.
+        """
+        if not isinstance(node, EnhancedNode):
+            raise ValueError("verify_element_visible requires an EnhancedNode instance")
+
+        backend_node_id = getattr(node, "backend_node_id", None)
+        if backend_node_id is None:
+            raise ValueError("EnhancedNode is missing backend_node_id")
+
+        resolved_session_id = session_id or self.registry.get_session_from_frame(node.frame_id)
+        resolved_session_id = await self._ensure_session_active(resolved_session_id)
+
+        x, y = node.click_point
+
+        # Get the element at the click point
+        result = await self.send(
+            "Runtime.evaluate",
+            {
+                "expression": f"document.elementFromPoint({x}, {y})",
+                "returnByValue": False,
+            },
+            session_id=resolved_session_id,
+        )
+
+        element_at_point_id = result.get("result", {}).get("objectId")
+        if not element_at_point_id:
+            return False
+
+        # Resolve our target node to compare
+        try:
+            resolved = await self.send(
+                "DOM.resolveNode",
+                {"backendNodeId": backend_node_id},
+                session_id=resolved_session_id,
+            )
+            target_object_id = resolved.get("object", {}).get("objectId")
+        except BrowserAgentError:
+            return False
+
+        if not target_object_id:
+            return False
+
+        # Check if element at point is our target or a descendant
+        check_result = await self.send(
+            "Runtime.callFunctionOn",
+            {
+                "objectId": element_at_point_id,
+                "functionDeclaration": """
+                    function(targetId) {
+                        // Get the target element by walking up from element at point
+                        let current = this;
+                        while (current) {
+                            if (current === targetId) return true;
+                            current = current.parentElement;
+                        }
+                        return false;
+                    }
+                """,
+                "arguments": [{"objectId": target_object_id}],
+                "returnByValue": True,
+            },
+            session_id=resolved_session_id,
+        )
+
+        return check_result.get("result", {}).get("value", False)
