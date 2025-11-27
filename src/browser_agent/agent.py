@@ -6,12 +6,11 @@ using an LLM backend to decide actions.
 """
 from __future__ import annotations
 
-import asyncio
+import json
 import logging
 import time
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
 
 from browser_agent.browser import Browser, BrowserConfig
 from browser_agent.core.models import ActionResult, AgentHistory, AgentStep, BrowserState
@@ -66,6 +65,10 @@ class AgentConfig:
     include_screenshot_in_state: bool = True
     verbose: bool = False
     
+    # Context management: keep only last N action/result pairs in history
+    # This prevents unbounded context growth
+    max_history_actions: int = 10
+    
     # Browser config (will be used if no browser is provided)
     browser_config: Optional[BrowserConfig] = None
 
@@ -81,8 +84,8 @@ class Agent:
     The agent follows a ReAct-style loop:
     1. Observe: Get browser state
     2. Think: Send state to LLM, get tool call
-    3. Act: Execute the tool
-    4. Repeat until done or max steps reached
+    3. Act: Execute the tool (only first tool per turn for safety)
+    4. Repeat until done tool is called or max steps reached
     
     Usage:
         backend = OpenAIBackend(api_key="...")  # or AnthropicBackend, etc.
@@ -109,7 +112,6 @@ class Agent:
         self.config = config or AgentConfig()
         self._browser = browser
         self._owns_browser = browser is None
-        self._history: Optional[AgentHistory] = None
     
     async def run(
         self,
@@ -126,7 +128,8 @@ class Agent:
         Returns:
             AgentHistory containing all steps and the final result.
         """
-        self._history = AgentHistory(task=task)
+        # Create history locally (not on self) to avoid concurrency issues
+        history = AgentHistory(task=task)
         start_time = time.time()
         
         # Set up browser
@@ -136,13 +139,15 @@ class Agent:
             browser = Browser(config=browser_config)
             await browser.start()
         
+        # Track action history for context management (separate from full message history)
+        action_history: List[Dict[str, Any]] = []
+        
         try:
             # Navigate to start URL if provided
             if start_url:
                 await browser.navigate(start_url)
             
-            # Initialize conversation
-            messages = self._init_messages(task)
+            # Get tool schemas
             tools = get_tool_schemas(format="openai")
             
             consecutive_failures = 0
@@ -150,27 +155,33 @@ class Agent:
             for step_num in range(1, self.config.max_steps + 1):
                 step_start = time.time()
                 
-                # Get current state
-                state = await browser.get_state(
-                    include_screenshot=self.config.include_screenshot_in_state
-                )
-                
-                # Add state to messages
-                messages.append({
-                    "role": "user",
-                    "content": self._format_state_message(state),
-                })
-                
-                if self.config.verbose:
-                    logger.info(f"Step {step_num}: Getting LLM response...")
-                
-                # Get LLM response
-                response = await self.llm.generate(messages, tools)
-                
-                # Handle response
-                if response.has_tool_calls:
-                    # Execute tool calls
-                    for tool_call in response.tool_calls:
+                try:
+                    # Get current state
+                    state = await browser.get_state(
+                        include_screenshot=self.config.include_screenshot_in_state
+                    )
+                    
+                    # Build messages with context pruning
+                    messages = self._build_messages(task, state, action_history)
+                    
+                    if self.config.verbose:
+                        logger.info(f"Step {step_num}: Getting LLM response...")
+                    
+                    # Get LLM response
+                    response = await self.llm.generate(messages, tools)
+                    
+                    # Handle response
+                    if response.has_tool_calls:
+                        # Execute only the FIRST tool call for safety
+                        # (subsequent tools may reference stale state after navigation)
+                        tool_call = response.tool_calls[0]
+                        
+                        if len(response.tool_calls) > 1 and self.config.verbose:
+                            logger.warning(
+                                f"LLM returned {len(response.tool_calls)} tool calls, "
+                                f"executing only the first: {tool_call.name}"
+                            )
+                        
                         result = await execute_tool(
                             browser,
                             tool_call.name,
@@ -186,92 +197,160 @@ class Agent:
                             url_before=state.url,
                             duration_ms=(time.time() - step_start) * 1000,
                         )
-                        self._history.add_step(step)
+                        history.add_step(step)
                         
-                        # Add tool result to messages
-                        messages.append({
-                            "role": "assistant",
-                            "content": None,
-                            "tool_calls": [{
+                        # Add to action history (with proper JSON serialization)
+                        action_history.append({
+                            "tool_call": {
                                 "id": tool_call.id,
-                                "type": "function",
-                                "function": {
-                                    "name": tool_call.name,
-                                    "arguments": str(tool_call.arguments),
-                                }
-                            }]
+                                "name": tool_call.name,
+                                "arguments": tool_call.arguments,
+                            },
+                            "result": result.to_message(),
                         })
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": tool_call.id,
-                            "content": result.to_message(),
-                        })
+                        
+                        # Prune action history to prevent context overflow
+                        if len(action_history) > self.config.max_history_actions:
+                            action_history = action_history[-self.config.max_history_actions:]
                         
                         if self.config.verbose:
                             logger.info(f"  {result.to_message()}")
                         
-                        # Check if done
+                        # Check if done (only via the done tool, not text matching)
                         if result.is_done:
-                            self._history.is_complete = True
-                            self._history.final_result = result.done_message
-                            self._history.total_duration_ms = (time.time() - start_time) * 1000
-                            return self._history
+                            history.is_complete = True
+                            history.final_result = result.done_message
+                            history.total_duration_ms = (time.time() - start_time) * 1000
+                            return history
                         
                         # Track failures
                         if result.result and not result.result.success:
                             consecutive_failures += 1
                             if consecutive_failures >= self.config.max_failures:
-                                self._history.final_result = f"Stopped after {consecutive_failures} consecutive failures"
-                                self._history.total_duration_ms = (time.time() - start_time) * 1000
-                                return self._history
+                                history.final_result = f"Stopped after {consecutive_failures} consecutive failures"
+                                history.total_duration_ms = (time.time() - start_time) * 1000
+                                return history
                         else:
                             consecutive_failures = 0
+                    
+                    elif response.content:
+                        # LLM responded with text instead of tool call
+                        # Log it but don't use text-based completion detection
+                        if self.config.verbose:
+                            logger.info(f"  LLM message (no tool call): {response.content[:200]}...")
+                        
+                        # Add a hint to the action history to guide the LLM
+                        action_history.append({
+                            "assistant_message": response.content[:500],
+                            "system_note": "Please use the 'done' tool to signal task completion, or another tool to continue.",
+                        })
                 
-                elif response.content:
-                    # LLM responded with text instead of tool call
-                    messages.append({
-                        "role": "assistant",
-                        "content": response.content,
-                    })
+                except Exception as step_error:
+                    # Handle errors within the step
+                    logger.error(f"Error in step {step_num}: {step_error}", exc_info=True)
                     
-                    if self.config.verbose:
-                        logger.info(f"  LLM message: {response.content[:200]}...")
+                    # Capture screenshot on error if configured
+                    error_screenshot = None
+                    if self.config.screenshot_on_error:
+                        try:
+                            error_screenshot = await browser.screenshot()
+                        except Exception:
+                            pass  # Best effort
                     
-                    # Check if this looks like a completion message
-                    if any(phrase in response.content.lower() for phrase in [
-                        "task complete", "done", "finished", "accomplished", "completed"
-                    ]):
-                        self._history.is_complete = True
-                        self._history.final_result = response.content
-                        break
+                    # Record the failed step
+                    step = AgentStep(
+                        step_number=step_num,
+                        action_type="error",
+                        action_params={"error": str(step_error)},
+                        result=ActionResult.error("step", str(step_error)),
+                        screenshot_after=error_screenshot,
+                        duration_ms=(time.time() - step_start) * 1000,
+                    )
+                    history.add_step(step)
+                    
+                    consecutive_failures += 1
+                    if consecutive_failures >= self.config.max_failures:
+                        history.final_result = f"Stopped after {consecutive_failures} consecutive failures. Last error: {step_error}"
+                        history.total_duration_ms = (time.time() - start_time) * 1000
+                        return history
             
             # Max steps reached
-            if not self._history.is_complete:
-                self._history.final_result = f"Max steps ({self.config.max_steps}) reached"
-            
-            self._history.total_duration_ms = (time.time() - start_time) * 1000
-            return self._history
+            history.final_result = f"Max steps ({self.config.max_steps}) reached without task completion"
+            history.total_duration_ms = (time.time() - start_time) * 1000
+            return history
+        
+        except Exception as e:
+            # Handle fatal errors outside the step loop
+            logger.error(f"Fatal error in agent run: {e}", exc_info=True)
+            history.final_result = f"Fatal error: {e}"
+            history.total_duration_ms = (time.time() - start_time) * 1000
+            return history
         
         finally:
             # Clean up browser if we created it
             if self._owns_browser and browser:
                 await browser.stop()
     
-    def _init_messages(self, task: str) -> List[Dict[str, Any]]:
-        """Initialize the conversation with system prompt and task."""
-        return [
+    def _build_messages(
+        self,
+        task: str,
+        current_state: BrowserState,
+        action_history: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Build the message list for the LLM with context pruning.
+        
+        Strategy: Keep system prompt + task + recent action history + current state.
+        This prevents unbounded context growth while maintaining relevant history.
+        """
+        messages = [
             {"role": "system", "content": get_system_prompt()},
-            {"role": "user", "content": f"Task: {task}\n\nPlease complete this task by interacting with the browser."},
+            {"role": "user", "content": f"Task: {task}\n\nPlease complete this task by interacting with the browser. Use the 'done' tool when the task is complete."},
         ]
+        
+        # Add action history (pruned to max_history_actions)
+        for action in action_history:
+            if "tool_call" in action:
+                tc = action["tool_call"]
+                # Use json.dumps for proper JSON serialization (not str())
+                messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": tc["id"],
+                        "type": "function",
+                        "function": {
+                            "name": tc["name"],
+                            "arguments": json.dumps(tc["arguments"]),
+                        }
+                    }]
+                })
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "content": action["result"],
+                })
+            elif "assistant_message" in action:
+                messages.append({
+                    "role": "assistant",
+                    "content": action["assistant_message"],
+                })
+                messages.append({
+                    "role": "user",
+                    "content": action.get("system_note", "Please continue with the task."),
+                })
+        
+        # Add current browser state (always fresh, not from history)
+        messages.append({
+            "role": "user",
+            "content": self._format_state_message(current_state),
+        })
+        
+        return messages
     
     def _format_state_message(self, state: BrowserState) -> str:
         """Format browser state for the LLM."""
-        return state.to_prompt(include_screenshot=self.config.include_screenshot_in_state)
-    
-    @property
-    def history(self) -> Optional[AgentHistory]:
-        """Get the history from the last run."""
-        return self._history
+        return f"Current browser state:\n\n{state.to_prompt(include_screenshot=self.config.include_screenshot_in_state)}"
 
 
 # =============================================================================

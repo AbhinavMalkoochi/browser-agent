@@ -453,6 +453,14 @@ class CDPClient:
                 target_id=target_id,
                 method="attach_to_target"
             ) from e
+    # Browser-level CDP domains that don't require a session
+    BROWSER_LEVEL_DOMAINS = frozenset({"Target", "Browser", "SystemInfo", "IO"})
+    
+    def _is_browser_level_method(self, method: str) -> bool:
+        """Check if a CDP method is browser-level (doesn't require a session)."""
+        domain = method.split(".")[0]
+        return domain in self.BROWSER_LEVEL_DOMAINS
+    
     async def send(self, method, params=None, session_id: Optional[str] = None, use_retry: bool = True):
         """Send a CDP command and wait for response."""
         if use_retry:
@@ -468,7 +476,11 @@ class CDPClient:
     
     async def _send_internal(self, method, params=None, session_id: Optional[str] = None):
         """Internal send implementation without retry."""
-        session_id = await self._ensure_session_active(session_id)
+        # Browser-level commands don't need a session
+        if not self._is_browser_level_method(method):
+            session_id = await self._ensure_session_active(session_id)
+        else:
+            session_id = None  # Explicitly no session for browser-level commands
         
         self.message_id += 1
         msg_id = self.message_id
