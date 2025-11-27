@@ -1,0 +1,564 @@
+"""
+LLM Backends - Real implementations for OpenAI, Anthropic, and Google Gemini.
+
+This module provides production-ready LLM backends that implement the LLMBackend
+protocol for use with the Agent class.
+
+Usage:
+    from llm_backends import OpenAIBackend, AnthropicBackend, GeminiBackend
+    
+    backend = OpenAIBackend(api_key="sk-...")
+    # or
+    backend = AnthropicBackend(api_key="sk-ant-...")
+    # or
+    backend = GeminiBackend(api_key="...")
+    
+    agent = Agent(backend)
+    result = await agent.run("Search for Python tutorials")
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
+
+from agent import LLMResponse, ToolCall
+
+logger = logging.getLogger("browser_agent")
+
+
+# =============================================================================
+# OpenAI Backend
+# =============================================================================
+
+class OpenAIBackend:
+    """
+    OpenAI GPT backend for the browser agent.
+    
+    Uses the openai Python SDK to call GPT-4o or other models with tool calling.
+    
+    Requirements:
+        pip install openai
+    
+    Usage:
+        backend = OpenAIBackend(api_key="sk-...", model="gpt-4o")
+        agent = Agent(backend)
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o",
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ):
+        """
+        Initialize the OpenAI backend.
+        
+        Args:
+            api_key: OpenAI API key. Defaults to OPENAI_API_KEY env var.
+            model: Model to use (gpt-4o, gpt-4o-mini, gpt-4-turbo, etc.)
+            temperature: Sampling temperature (0.0 = deterministic).
+            max_tokens: Maximum tokens in response.
+        """
+        try:
+            from openai import AsyncOpenAI
+        except ImportError:
+            raise ImportError(
+                "OpenAI SDK not installed. Run: pip install openai"
+            )
+        
+        self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "OpenAI API key required. Set OPENAI_API_KEY env var or pass api_key."
+            )
+        
+        self.client = AsyncOpenAI(api_key=self.api_key)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+    
+    async def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> LLMResponse:
+        """Generate a response using OpenAI's API."""
+        try:
+            response = await self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                tools=tools if tools else None,
+                tool_choice="auto" if tools else None,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+            )
+            
+            choice = response.choices[0]
+            message = choice.message
+            
+            # Extract tool calls if present
+            tool_calls = []
+            if message.tool_calls:
+                for tc in message.tool_calls:
+                    try:
+                        args = json.loads(tc.function.arguments)
+                    except json.JSONDecodeError:
+                        args = {}
+                    
+                    tool_calls.append(ToolCall(
+                        id=tc.id,
+                        name=tc.function.name,
+                        arguments=args,
+                    ))
+            
+            return LLMResponse(
+                content=message.content,
+                tool_calls=tool_calls,
+                finish_reason=choice.finish_reason or "stop",
+            )
+        
+        except Exception as e:
+            logger.error(f"OpenAI API error: {e}")
+            raise
+
+
+# =============================================================================
+# Anthropic Backend
+# =============================================================================
+
+class AnthropicBackend:
+    """
+    Anthropic Claude backend for the browser agent.
+    
+    Uses the anthropic Python SDK to call Claude models with tool use.
+    
+    Requirements:
+        pip install anthropic
+    
+    Usage:
+        backend = AnthropicBackend(api_key="sk-ant-...", model="claude-sonnet-4-20250514")
+        agent = Agent(backend)
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "claude-sonnet-4-20250514",
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ):
+        """
+        Initialize the Anthropic backend.
+        
+        Args:
+            api_key: Anthropic API key. Defaults to ANTHROPIC_API_KEY env var.
+            model: Model to use (claude-sonnet-4-20250514, claude-3-5-sonnet, etc.)
+            temperature: Sampling temperature (0.0 = deterministic).
+            max_tokens: Maximum tokens in response.
+        """
+        try:
+            from anthropic import AsyncAnthropic
+        except ImportError:
+            raise ImportError(
+                "Anthropic SDK not installed. Run: pip install anthropic"
+            )
+        
+        self.api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "Anthropic API key required. Set ANTHROPIC_API_KEY env var or pass api_key."
+            )
+        
+        self.client = AsyncAnthropic(api_key=self.api_key)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+    
+    def _convert_messages_to_anthropic(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[str, List[Dict[str, Any]]]:
+        """
+        Convert OpenAI-style messages to Anthropic format.
+        
+        Returns:
+            Tuple of (system_prompt, messages)
+        """
+        system_prompt = ""
+        anthropic_messages = []
+        
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            if role == "system":
+                system_prompt = content or ""
+            elif role == "user":
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": content or "",
+                })
+            elif role == "assistant":
+                # Handle assistant messages with tool calls
+                if msg.get("tool_calls"):
+                    content_blocks = []
+                    if content:
+                        content_blocks.append({"type": "text", "text": content})
+                    
+                    for tc in msg["tool_calls"]:
+                        # Parse arguments if they're a string
+                        args = tc["function"]["arguments"]
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        
+                        content_blocks.append({
+                            "type": "tool_use",
+                            "id": tc["id"],
+                            "name": tc["function"]["name"],
+                            "input": args,
+                        })
+                    
+                    anthropic_messages.append({
+                        "role": "assistant",
+                        "content": content_blocks,
+                    })
+                else:
+                    anthropic_messages.append({
+                        "role": "assistant",
+                        "content": content or "",
+                    })
+            elif role == "tool":
+                # Tool results in Anthropic format
+                anthropic_messages.append({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": msg.get("tool_call_id"),
+                        "content": content or "",
+                    }],
+                })
+        
+        return system_prompt, anthropic_messages
+    
+    def _convert_tools_to_anthropic(
+        self,
+        tools: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Convert OpenAI-style tools to Anthropic format."""
+        anthropic_tools = []
+        
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool["function"]
+                anthropic_tools.append({
+                    "name": func["name"],
+                    "description": func.get("description", ""),
+                    "input_schema": func.get("parameters", {"type": "object", "properties": {}}),
+                })
+        
+        return anthropic_tools
+    
+    async def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> LLMResponse:
+        """Generate a response using Anthropic's API."""
+        try:
+            system_prompt, anthropic_messages = self._convert_messages_to_anthropic(messages)
+            anthropic_tools = self._convert_tools_to_anthropic(tools)
+            
+            response = await self.client.messages.create(
+                model=self.model,
+                system=system_prompt,
+                messages=anthropic_messages,
+                tools=anthropic_tools if anthropic_tools else None,
+                max_tokens=self.max_tokens,
+                temperature=self.temperature,
+            )
+            
+            # Extract content and tool calls
+            content_text = ""
+            tool_calls = []
+            
+            for block in response.content:
+                if block.type == "text":
+                    content_text += block.text
+                elif block.type == "tool_use":
+                    tool_calls.append(ToolCall(
+                        id=block.id,
+                        name=block.name,
+                        arguments=dict(block.input) if block.input else {},
+                    ))
+            
+            return LLMResponse(
+                content=content_text if content_text else None,
+                tool_calls=tool_calls,
+                finish_reason=response.stop_reason or "stop",
+            )
+        
+        except Exception as e:
+            logger.error(f"Anthropic API error: {e}")
+            raise
+
+
+# =============================================================================
+# Google Gemini Backend
+# =============================================================================
+
+class GeminiBackend:
+    """
+    Google Gemini backend for the browser agent.
+    
+    Uses the google-genai Python SDK to call Gemini models with function calling.
+    
+    Requirements:
+        pip install google-genai
+    
+    Usage:
+        backend = GeminiBackend(api_key="...", model="gemini-2.5-flash")
+        agent = Agent(backend)
+    """
+    
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gemini-2.5-flash",
+        temperature: float = 0.0,
+        max_tokens: int = 4096,
+    ):
+        """
+        Initialize the Gemini backend.
+        
+        Args:
+            api_key: Google AI API key. Defaults to GOOGLE_API_KEY env var.
+            model: Model to use (gemini-2.5-flash, gemini-2.0-flash, etc.)
+            temperature: Sampling temperature (0.0 = deterministic).
+            max_tokens: Maximum tokens in response.
+        """
+        try:
+            from google import genai
+            from google.genai import types
+            self._genai = genai
+            self._types = types
+        except ImportError:
+            raise ImportError(
+                "Google GenAI SDK not installed. Run: pip install google-genai"
+            )
+        
+        self.api_key = api_key or os.environ.get("GOOGLE_API_KEY")
+        if not self.api_key:
+            raise ValueError(
+                "Google API key required. Set GOOGLE_API_KEY env var or pass api_key."
+            )
+        
+        self.client = genai.Client(api_key=self.api_key)
+        self.model = model
+        self.temperature = temperature
+        self.max_tokens = max_tokens
+    
+    def _convert_messages_to_gemini(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> tuple[str, List[Any]]:
+        """
+        Convert OpenAI-style messages to Gemini format.
+        
+        Returns:
+            Tuple of (system_instruction, contents)
+        """
+        types = self._types
+        system_instruction = ""
+        contents = []
+        
+        for msg in messages:
+            role = msg.get("role")
+            content = msg.get("content")
+            
+            if role == "system":
+                system_instruction = content or ""
+            elif role == "user":
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=content or "")],
+                ))
+            elif role == "assistant":
+                if msg.get("tool_calls"):
+                    # Assistant message with tool calls
+                    parts = []
+                    if content:
+                        parts.append(types.Part.from_text(text=content))
+                    
+                    for tc in msg["tool_calls"]:
+                        args = tc["function"]["arguments"]
+                        if isinstance(args, str):
+                            try:
+                                args = json.loads(args)
+                            except json.JSONDecodeError:
+                                args = {}
+                        
+                        parts.append(types.Part.from_function_call(
+                            name=tc["function"]["name"],
+                            args=args,
+                        ))
+                    
+                    contents.append(types.Content(role="model", parts=parts))
+                else:
+                    contents.append(types.Content(
+                        role="model",
+                        parts=[types.Part.from_text(text=content or "")],
+                    ))
+            elif role == "tool":
+                # Tool response
+                tool_call_id = msg.get("tool_call_id", "")
+                # Find the function name from the tool_call_id
+                func_name = tool_call_id.split("_")[0] if "_" in tool_call_id else "unknown"
+                
+                contents.append(types.Content(
+                    role="tool",
+                    parts=[types.Part.from_function_response(
+                        name=func_name,
+                        response={"result": content},
+                    )],
+                ))
+        
+        return system_instruction, contents
+    
+    def _convert_tools_to_gemini(
+        self,
+        tools: List[Dict[str, Any]],
+    ) -> List[Any]:
+        """Convert OpenAI-style tools to Gemini format."""
+        types = self._types
+        function_declarations = []
+        
+        for tool in tools:
+            if tool.get("type") == "function":
+                func = tool["function"]
+                function_declarations.append(types.FunctionDeclaration(
+                    name=func["name"],
+                    description=func.get("description", ""),
+                    parameters_json_schema=func.get("parameters", {"type": "object", "properties": {}}),
+                ))
+        
+        if function_declarations:
+            return [types.Tool(function_declarations=function_declarations)]
+        return []
+    
+    async def generate(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> LLMResponse:
+        """Generate a response using Gemini's API."""
+        try:
+            types = self._types
+            system_instruction, contents = self._convert_messages_to_gemini(messages)
+            gemini_tools = self._convert_tools_to_gemini(tools)
+            
+            config = types.GenerateContentConfig(
+                temperature=self.temperature,
+                max_output_tokens=self.max_tokens,
+                tools=gemini_tools if gemini_tools else None,
+            )
+            
+            if system_instruction:
+                config.system_instruction = system_instruction
+            
+            # Use async generate_content
+            response = await self.client.aio.models.generate_content(
+                model=self.model,
+                contents=contents if contents else "Hello",
+                config=config,
+            )
+            
+            # Extract content and function calls
+            content_text = ""
+            tool_calls = []
+            
+            if response.text:
+                content_text = response.text
+            
+            if response.function_calls:
+                for i, fc in enumerate(response.function_calls):
+                    tool_calls.append(ToolCall(
+                        id=f"{fc.name}_{i}",
+                        name=fc.name,
+                        arguments=dict(fc.args) if fc.args else {},
+                    ))
+            
+            # Determine finish reason
+            finish_reason = "stop"
+            if tool_calls:
+                finish_reason = "tool_calls"
+            
+            return LLMResponse(
+                content=content_text if content_text else None,
+                tool_calls=tool_calls,
+                finish_reason=finish_reason,
+            )
+        
+        except Exception as e:
+            logger.error(f"Gemini API error: {e}")
+            raise
+
+
+# =============================================================================
+# Factory Function
+# =============================================================================
+
+def create_backend(
+    provider: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    **kwargs,
+) -> OpenAIBackend | AnthropicBackend | GeminiBackend:
+    """
+    Factory function to create an LLM backend.
+    
+    Args:
+        provider: One of "openai", "anthropic", "gemini".
+        api_key: API key (optional, will use env var if not provided).
+        model: Model name (optional, will use default if not provided).
+        **kwargs: Additional arguments passed to the backend constructor.
+    
+    Returns:
+        An LLM backend instance.
+    
+    Example:
+        backend = create_backend("openai", model="gpt-4o-mini")
+        backend = create_backend("anthropic")
+        backend = create_backend("gemini", api_key="...")
+    """
+    provider = provider.lower()
+    
+    if provider == "openai":
+        return OpenAIBackend(
+            api_key=api_key,
+            model=model or "gpt-4o",
+            **kwargs,
+        )
+    elif provider == "anthropic":
+        return AnthropicBackend(
+            api_key=api_key,
+            model=model or "claude-sonnet-4-20250514",
+            **kwargs,
+        )
+    elif provider == "gemini":
+        return GeminiBackend(
+            api_key=api_key,
+            model=model or "gemini-2.5-flash",
+            **kwargs,
+        )
+    else:
+        raise ValueError(
+            f"Unknown provider: {provider}. Use 'openai', 'anthropic', or 'gemini'."
+        )
+
