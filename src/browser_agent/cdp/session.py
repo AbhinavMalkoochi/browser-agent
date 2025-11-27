@@ -1,3 +1,6 @@
+"""
+CDP Session Management - Manages sessions, targets, and frames.
+"""
 from dataclasses import dataclass, field
 from typing import Set, Dict, Optional, List
 from enum import Enum
@@ -23,13 +26,13 @@ class TargetInfo:
 
 @dataclass
 class FrameInfo:
+    """Information about a frame."""
     frame_id: str
     parent_frame_id: Optional[str]
     url: str
     origin: str
     target_id: Optional[str] = None
     session_id: Optional[str] = None
-
 
 
 @dataclass
@@ -185,7 +188,8 @@ class SessionManager:
         if frame:
             frame.target_id = target_id
             frame.session_id = session_id
-    def get_session_from_frame(self, frame_id: str):
+
+    def get_session_from_frame(self, frame_id: str) -> Optional[str]:
         """Get session ID for a given frame ID."""
         frame = self.frames.get(frame_id)
         return frame.session_id if frame else None
@@ -208,3 +212,4 @@ class SessionManager:
             del self.children[frame_id]
         
         del self.frames[frame_id]
+

@@ -5,9 +5,10 @@ LLM-friendly text plus a selector map for resolving follow-up actions.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-from enhanced_merger import EnhancedNode
+if TYPE_CHECKING:
+    from browser_agent.utils.merger import EnhancedNode
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ DEFAULT_ATTR_ALLOWLIST: Tuple[str, ...] = (
 
 
 def serialize_dom(
-    nodes: Iterable[EnhancedNode],
+    nodes: Iterable[Any],  # Iterable[EnhancedNode]
     *,
     max_lines: int = 400,
     attr_allowlist: Sequence[str] = DEFAULT_ATTR_ALLOWLIST,

@@ -7,13 +7,11 @@ selecting dropdowns, and submitting.
 
 Prerequisites:
 - Chrome must be running with debugging enabled:
-  python launch_chrome.py
+  python -m browser_agent.launch_chrome
 """
 import asyncio
-import sys
-sys.path.insert(0, '..')
 
-from browser import Browser
+from browser_agent import Browser
 
 
 async def main():
@@ -53,4 +51,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

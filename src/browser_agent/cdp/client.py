@@ -11,9 +11,9 @@ import httpx
 import websockets
 from websockets.asyncio.client import connect
 
-from enhanced_merger import  EnhancedNode
-from targets import SessionManager, SessionStatus
-from errors import (
+from browser_agent.utils.merger import EnhancedNode
+from browser_agent.cdp.session import SessionManager, SessionStatus
+from browser_agent.core.errors import (
     BrowserAgentError,
     CDPConnectionError,
     CDPTimeoutError,

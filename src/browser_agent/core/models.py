@@ -4,10 +4,10 @@ Browser Agent Models - Data classes for browser state and action results.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
-from enhanced_merger import EnhancedNode
-from serialization import SelectorEntry
+if TYPE_CHECKING:
+    from browser_agent.core.serialization import SelectorEntry
 
 
 @dataclass
@@ -22,13 +22,13 @@ class BrowserState:
     url: str
     title: str
     dom_text: str
-    selector_map: Dict[int, SelectorEntry]
+    selector_map: Dict[int, Any]  # Dict[int, SelectorEntry]
     screenshot_base64: Optional[str] = None
     viewport_width: int = 1280
     viewport_height: int = 720
     element_count: int = 0
     
-    def get_element(self, index: int) -> Optional[SelectorEntry]:
+    def get_element(self, index: int) -> Optional[Any]:
         """
         Get element metadata by index.
         
@@ -142,7 +142,7 @@ class AgentStep:
     
     step_number: int
     action_type: str
-    action_params: Dict[str, any] = field(default_factory=dict)
+    action_params: Dict[str, Any] = field(default_factory=dict)
     result: Optional[ActionResult] = None
     url_before: Optional[str] = None
     url_after: Optional[str] = None

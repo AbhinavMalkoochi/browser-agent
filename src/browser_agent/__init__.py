@@ -23,17 +23,31 @@ Low-level tool execution:
     tools = get_tool_schemas(format="openai")
     result = await execute_tool(browser, "click", {"index": 1})
 """
-from agent import Agent, AgentConfig, DummyLLMBackend, LLMBackend, LLMResponse, ToolCall
-from browser import Browser, BrowserConfig
-from llm_backends import AnthropicBackend, GeminiBackend, OpenAIBackend, create_backend
-from models import ActionResult, AgentHistory, AgentStep, BrowserState
-from serialization import SelectorEntry, SerializedOutput, serialize_dom
-from tools import (
+from browser_agent.browser import Browser, BrowserConfig
+from browser_agent.agent import Agent, AgentConfig, DummyLLMBackend, LLMBackend
+from browser_agent.core.types import LLMResponse, ToolCall
+from browser_agent.core.models import ActionResult, AgentHistory, AgentStep, BrowserState
+from browser_agent.core.serialization import SelectorEntry, SerializedOutput, serialize_dom
+from browser_agent.core.errors import (
+    BrowserAgentError,
+    CDPConnectionError,
+    CDPTimeoutError,
+    CDPProtocolError,
+    CDPSessionError,
+    CDPTargetError,
+)
+from browser_agent.llm.tools import (
     TOOL_DEFINITIONS,
     ToolExecutionResult,
     execute_tool,
     get_system_prompt,
     get_tool_schemas,
+)
+from browser_agent.llm.backends import (
+    OpenAIBackend,
+    AnthropicBackend,
+    GeminiBackend,
+    create_backend,
 )
 
 __version__ = "0.1.0"
@@ -63,6 +77,13 @@ __all__ = [
     "SelectorEntry",
     "SerializedOutput",
     "serialize_dom",
+    # Errors
+    "BrowserAgentError",
+    "CDPConnectionError",
+    "CDPTimeoutError",
+    "CDPProtocolError",
+    "CDPSessionError",
+    "CDPTargetError",
     # LLM Integration
     "TOOL_DEFINITIONS",
     "ToolExecutionResult",
@@ -72,3 +93,4 @@ __all__ = [
     # Version
     "__version__",
 ]
+

@@ -9,8 +9,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from browser import Browser
-from models import ActionResult
+from browser_agent.browser import Browser
+from browser_agent.core.models import ActionResult
 
 
 # =============================================================================

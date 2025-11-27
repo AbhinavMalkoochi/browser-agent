@@ -13,9 +13,10 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Protocol, runtime_checkable
 
-from browser import Browser, BrowserConfig
-from models import ActionResult, AgentHistory, AgentStep, BrowserState
-from tools import (
+from browser_agent.browser import Browser, BrowserConfig
+from browser_agent.core.models import ActionResult, AgentHistory, AgentStep, BrowserState
+from browser_agent.core.types import LLMResponse, ToolCall
+from browser_agent.llm.tools import (
     ToolExecutionResult,
     execute_tool,
     get_system_prompt,
@@ -49,26 +50,6 @@ class LLMBackend(Protocol):
             LLMResponse with either a message or tool calls.
         """
         ...
-
-
-@dataclass
-class ToolCall:
-    """A single tool call from the LLM."""
-    id: str
-    name: str
-    arguments: Dict[str, Any]
-
-
-@dataclass
-class LLMResponse:
-    """Response from an LLM backend."""
-    content: Optional[str] = None
-    tool_calls: List[ToolCall] = field(default_factory=list)
-    finish_reason: str = "stop"
-    
-    @property
-    def has_tool_calls(self) -> bool:
-        return len(self.tool_calls) > 0
 
 
 # =============================================================================
@@ -334,4 +315,3 @@ class DummyLLMBackend:
                 arguments={"direction": "down", "amount": 300}
             )]
         )
-

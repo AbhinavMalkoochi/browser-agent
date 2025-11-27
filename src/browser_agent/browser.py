@@ -14,12 +14,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from cdp import CDPClient, get_page_ws_url
-from dom.main import get_dom
-from enhanced_merger import BrowserDataMerger, EnhancedNode
-from errors import BrowserAgentError, CDPConnectionError
-from models import ActionResult, BrowserState
-from serialization import SelectorEntry, serialize_dom
+from browser_agent.cdp.client import CDPClient, get_page_ws_url
+from browser_agent.cdp.dom import get_dom
+from browser_agent.utils.merger import BrowserDataMerger, EnhancedNode
+from browser_agent.core.errors import BrowserAgentError, CDPConnectionError
+from browser_agent.core.models import ActionResult, BrowserState
+from browser_agent.core.serialization import SelectorEntry, serialize_dom
 
 logger = logging.getLogger("browser_agent")
 

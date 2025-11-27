@@ -6,6 +6,7 @@ A high-performance browser automation library using Chrome DevTools Protocol (CD
 
 - **Clean Async API**: Simple `Browser` class with async context manager support
 - **LLM-Ready**: Built-in tool schemas for OpenAI and Anthropic, plus a ready-to-use `Agent` class
+- **Multiple LLM Backends**: Built-in support for OpenAI, Anthropic Claude, and Google Gemini
 - **Intelligent Element Detection**: Correlates DOM, DOMSnapshot, and Accessibility data
 - **Precise Actions**: Click, type, scroll, select dropdowns, press keys
 - **Confidence Scoring**: Ranks elements by actionability (0-1 scale)
@@ -30,13 +31,31 @@ uv sync
 
 # Or with pip
 pip install -e .
+
+# Install with LLM backend support
+pip install -e ".[openai]"      # For OpenAI
+pip install -e ".[anthropic]"   # For Anthropic
+pip install -e ".[gemini]"      # For Google Gemini
+pip install -e ".[all-llms]"    # For all LLM backends
+```
+
+### Launch Chrome
+
+Before running any scripts, start Chrome with CDP debugging enabled:
+
+```bash
+# Run as a module
+python -m browser_agent
+
+# Or with options
+python -m browser_agent --headless --remote-debugging-port=9222
 ```
 
 ### Basic Usage
 
 ```python
 import asyncio
-from browser import Browser
+from browser_agent import Browser
 
 async def main():
     async with Browser() as browser:
@@ -61,18 +80,17 @@ asyncio.run(main())
 
 ```python
 import asyncio
-from agent import Agent, AgentConfig
-from browser import BrowserConfig
-
-# Implement your LLM backend (see agent.py for protocol)
-class MyLLMBackend:
-    async def generate(self, messages, tools):
-        # Call your LLM API here
-        ...
+from browser_agent import Agent, AgentConfig, BrowserConfig, OpenAIBackend
 
 async def main():
-    backend = MyLLMBackend()
-    config = AgentConfig(max_steps=30, verbose=True)
+    # Use built-in OpenAI backend (or AnthropicBackend, GeminiBackend)
+    backend = OpenAIBackend(model="gpt-4o")
+    
+    config = AgentConfig(
+        max_steps=30,
+        verbose=True,
+        browser_config=BrowserConfig(headless=False),
+    )
 
     agent = Agent(backend, config=config)
     history = await agent.run(
@@ -90,7 +108,7 @@ asyncio.run(main())
 ### Low-Level Tool Execution
 
 ```python
-from tools import get_tool_schemas, execute_tool
+from browser_agent import get_tool_schemas, execute_tool
 
 # Get tool schemas for your LLM
 tools = get_tool_schemas(format="openai")  # or "anthropic"
@@ -105,7 +123,7 @@ print(result.to_message())  # "✓ click on element [3]"
 ### Browser Class
 
 ```python
-from browser import Browser, BrowserConfig
+from browser_agent import Browser, BrowserConfig
 
 config = BrowserConfig(
     headless=False,           # Run with visible browser
@@ -173,7 +191,7 @@ class ActionResult:
 ### Agent Class
 
 ```python
-from agent import Agent, AgentConfig, LLMBackend
+from browser_agent import Agent, AgentConfig, LLMBackend
 
 config = AgentConfig(
     max_steps=50,              # Maximum actions before stopping
@@ -186,10 +204,28 @@ agent = Agent(llm_backend, config=config)
 history = await agent.run(task="...", start_url="https://...")
 ```
 
+### LLM Backends
+
+```python
+from browser_agent import OpenAIBackend, AnthropicBackend, GeminiBackend, create_backend
+
+# OpenAI
+backend = OpenAIBackend(model="gpt-4o", temperature=0.0)
+
+# Anthropic Claude
+backend = AnthropicBackend(model="claude-sonnet-4-20250514", temperature=0.0)
+
+# Google Gemini
+backend = GeminiBackend(model="gemini-2.5-flash", temperature=0.0)
+
+# Factory function
+backend = create_backend("openai", model="gpt-4o-mini")
+```
+
 ### Tool Schemas
 
 ```python
-from tools import get_tool_schemas, TOOL_DEFINITIONS
+from browser_agent import get_tool_schemas, TOOL_DEFINITIONS
 
 # Get all tools in OpenAI format
 tools = get_tool_schemas(format="openai")
@@ -219,20 +255,40 @@ tools = get_tool_schemas(
 
 ```
 browser-agent/
-├── __init__.py          # Package exports
-├── browser.py           # High-level Browser class
-├── agent.py             # LLM Agent with ReAct loop
-├── tools.py             # Tool schemas and executor
-├── cdp.py               # CDP WebSocket client
-├── models.py            # Data classes (BrowserState, ActionResult, etc.)
-├── serialization.py     # DOM → LLM text conversion
-├── enhanced_merger.py   # DOM/AX/Snapshot correlation
-├── targets.py           # Session/frame management
-├── errors.py            # Custom exceptions
-├── dom/
-│   └── main.py          # Raw DOM data collection
-└── tests/
-    └── test_actions.py  # Integration tests
+├── src/
+│   └── browser_agent/
+│       ├── __init__.py          # Package exports
+│       ├── __main__.py          # CLI entry point (launch Chrome)
+│       ├── browser.py           # High-level Browser class
+│       ├── agent.py             # LLM Agent with ReAct loop
+│       ├── cdp/
+│       │   ├── __init__.py
+│       │   ├── client.py        # CDP WebSocket client
+│       │   ├── session.py       # Session/frame management
+│       │   └── dom.py           # Raw DOM data collection
+│       ├── core/
+│       │   ├── __init__.py
+│       │   ├── models.py        # Data classes (BrowserState, ActionResult)
+│       │   ├── errors.py        # Custom exceptions
+│       │   ├── serialization.py # DOM → LLM text conversion
+│       │   └── types.py         # LLM types (ToolCall, LLMResponse)
+│       ├── llm/
+│       │   ├── __init__.py
+│       │   ├── tools.py         # Tool schemas and executor
+│       │   └── backends.py      # OpenAI, Anthropic, Gemini backends
+│       └── utils/
+│           ├── __init__.py
+│           └── merger.py        # DOM/AX/Snapshot correlation
+├── examples/
+│   ├── basic_navigation.py
+│   ├── form_filling.py
+│   ├── agent_demo.py
+│   ├── agent_with_openai.py
+│   ├── agent_with_anthropic.py
+│   └── agent_with_gemini.py
+├── tests/
+├── pyproject.toml
+└── README.md
 ```
 
 ### Data Flow
@@ -274,25 +330,29 @@ browser-agent/
 
 ```bash
 # Start Chrome first
-python launch_chrome.py
+python -m browser_agent
 
 # Run tests
 pytest tests/
 ```
 
-### Manual Testing
+### Running Examples
 
-```python
-# Quick test with dummy backend
-import asyncio
-from agent import Agent, DummyLLMBackend
+```bash
+# Basic navigation
+python examples/basic_navigation.py
 
-async def test():
-    agent = Agent(DummyLLMBackend(max_steps=3))
-    history = await agent.run("Test task", start_url="https://example.com")
-    print(history)
+# With OpenAI (requires OPENAI_API_KEY)
+export OPENAI_API_KEY="sk-..."
+python examples/agent_with_openai.py
 
-asyncio.run(test())
+# With Anthropic (requires ANTHROPIC_API_KEY)
+export ANTHROPIC_API_KEY="sk-ant-..."
+python examples/agent_with_anthropic.py
+
+# With Gemini (requires GOOGLE_API_KEY)
+export GOOGLE_API_KEY="..."
+python examples/agent_with_gemini.py
 ```
 
 ## Troubleshooting
@@ -304,7 +364,7 @@ asyncio.run(test())
 curl http://localhost:9222/json
 
 # Launch Chrome manually
-python launch_chrome.py
+python -m browser_agent
 ```
 
 ### No Elements Found

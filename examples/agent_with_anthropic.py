@@ -6,8 +6,9 @@ Demonstrates using the Agent class with a real Anthropic Claude backend.
 
 Prerequisites:
 - Chrome must be running with debugging enabled:
-  python launch_chrome.py
+  python -m browser_agent.launch_chrome
 - Set ANTHROPIC_API_KEY environment variable
+- Install anthropic: pip install browser-agent[anthropic]
 
 Usage:
     export ANTHROPIC_API_KEY="sk-ant-..."
@@ -16,11 +17,8 @@ Usage:
 import asyncio
 import os
 import sys
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agent import Agent, AgentConfig
-from browser import BrowserConfig
-from llm_backends import AnthropicBackend
+from browser_agent import Agent, AgentConfig, BrowserConfig, AnthropicBackend
 
 
 async def main():
@@ -77,4 +75,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

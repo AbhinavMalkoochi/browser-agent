@@ -8,14 +8,11 @@ OpenAI, Anthropic, or another LLM API.
 
 Prerequisites:
 - Chrome must be running with debugging enabled:
-  python launch_chrome.py
+  python -m browser_agent.launch_chrome
 """
 import asyncio
-import sys
-sys.path.insert(0, '..')
 
-from agent import Agent, AgentConfig, DummyLLMBackend, LLMResponse, ToolCall
-from browser import BrowserConfig
+from browser_agent import Agent, AgentConfig, LLMResponse, ToolCall, BrowserConfig
 
 
 class SimpleDemoBackend:
@@ -91,4 +88,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-

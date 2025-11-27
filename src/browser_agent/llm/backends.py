@@ -24,7 +24,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from agent import LLMResponse, ToolCall
+from browser_agent.core.types import LLMResponse, ToolCall
 
 logger = logging.getLogger("browser_agent")
 
