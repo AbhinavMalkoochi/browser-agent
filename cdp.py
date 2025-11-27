@@ -86,171 +86,7 @@ class CDPClient:
             "max_delay": 2.0,
             "backoff_multiplier": 2.0,
         }
-    async def go_back(self, session_id: Optional[str] = None):
-        """
-        Navigate back in browser history.
-        
-        Args:
-            session_id: Optional explicit session override.
-        """
-        session_id = await self._ensure_session_active(session_id)
-        
-        # Get current history entry
-        history = await self.send("Page.getNavigationHistory", {}, session_id=session_id)
-        current_index = history.get("currentIndex", 0)
-        entries = history.get("entries", [])
-        
-        if current_index > 0:
-            prev_entry = entries[current_index - 1]
-            await self.send(
-                "Page.navigateToHistoryEntry",
-                {"entryId": prev_entry["id"]},
-                session_id=session_id,
-            )
-        else:
-            logger.warning("Cannot go back: already at first history entry", extra={"session_id": session_id})
-    
-    async def go_forward(self, session_id: Optional[str] = None):
-        """
-        Navigate forward in browser history.
-        
-        Args:
-            session_id: Optional explicit session override.
-        """
-        session_id = await self._ensure_session_active(session_id)
-        
-        # Get current history entry
-        history = await self.send("Page.getNavigationHistory", {}, session_id=session_id)
-        current_index = history.get("currentIndex", 0)
-        entries = history.get("entries", [])
-        
-        if current_index < len(entries) - 1:
-            next_entry = entries[current_index + 1]
-            await self.send(
-                "Page.navigateToHistoryEntry",
-                {"entryId": next_entry["id"]},
-                session_id=session_id,
-            )
-        else:
-            logger.warning("Cannot go forward: already at last history entry", extra={"session_id": session_id})
-    
-    async def refresh(self, session_id: Optional[str] = None):
-        """
-        Refresh the current page.
-        
-        Args:
-            session_id: Optional explicit session override.
-        """
-        session_id = await self._ensure_session_active(session_id)
-        await self.send("Page.reload", {}, session_id=session_id)
-    
-    async def scroll_page(
-        self,
-        direction: str = "down",
-        amount: int = 500,
-        session_id: Optional[str] = None,
-    ):
-        """
-        Scroll the page in the specified direction.
-        
-        Args:
-            direction: Scroll direction - "up", "down", "left", or "right".
-            amount: Scroll amount in pixels (default: 500).
-            session_id: Optional explicit session override.
-        """
-        session_id = await self._ensure_session_active(session_id)
-        
-        # Get viewport size for scroll calculations
-        metrics = await self.send("Page.getLayoutMetrics", {}, session_id=session_id)
-        viewport = metrics.get("visualViewport", {})
-        viewport_x = viewport.get("clientWidth", 640)
-        viewport_y = viewport.get("clientHeight", 480)
-        
-        # Calculate scroll coordinates (center of viewport)
-        x = viewport_x / 2
-        y = viewport_y / 2
-        
-        # Calculate delta based on direction
-        delta_x = 0
-        delta_y = 0
-        
-        direction_lower = direction.lower()
-        if direction_lower == "down":
-            delta_y = amount
-        elif direction_lower == "up":
-            delta_y = -amount
-        elif direction_lower == "right":
-            delta_x = amount
-        elif direction_lower == "left":
-            delta_x = -amount
-        else:
-            raise ValueError(f"Invalid scroll direction: {direction}. Must be 'up', 'down', 'left', or 'right'")
-        
-        # Dispatch mouse wheel event
-        await self.send(
-            "Input.dispatchMouseEvent",
-            {
-                "type": "mouseWheel",
-                "x": x,
-                "y": y,
-                "deltaX": delta_x,
-                "deltaY": delta_y,
-                "modifiers": 0,
-            },
-            session_id=session_id,
-        )
-    
-    async def capture_screenshot(
-        self,
-        format: str = "jpeg",
-        quality: int = 80,
-        full_page: bool = False,
-        session_id: Optional[str] = None,
-    ) -> str:
-        """
-        Capture a screenshot of the current page.
-        
-        Args:
-            format: Image format - "jpeg" or "png" (default: "jpeg").
-            quality: JPEG quality 0-100, ignored for PNG (default: 80).
-            full_page: If True, capture full page; if False, capture viewport only (default: False).
-            session_id: Optional explicit session override.
-        
-        Returns:
-            Base64-encoded image string.
-        """
-        session_id = await self._ensure_session_active(session_id)
-        
-        params = {
-            "format": format,
-        }
-        
-        if format == "jpeg":
-            params["quality"] = max(0, min(100, quality))
-        
-        if full_page:
-            # For full page, we need to get the content size
-            metrics = await self.send("Page.getLayoutMetrics", {}, session_id=session_id)
-            content_size = metrics.get("contentSize", {})
-            params["clip"] = {
-                "x": 0,
-                "y": 0,
-                "width": content_size.get("width", 1920),
-                "height": content_size.get("height", 1080),
-                "scale": 1.0,
-            }
-        
-        result = await self.send("Page.captureScreenshot", params, session_id=session_id)
-        image_data = result.get("data", "")
-        
-        if not image_data:
-            raise CDPProtocolError(
-                "Screenshot capture returned empty data",
-                session_id=session_id,
-                method="capture_screenshot",
-            )
-        
-        return image_data
+
     def _now(self) -> float:
         return asyncio.get_running_loop().time()
     
@@ -1374,16 +1210,284 @@ class CDPClient:
                 {"text": text},
                 session_id=resolved_session_id,
                     )
-    def get_session_for_node(self,node:dict)->Optional[str]:
-        frame_id = node.get('frameId')
-        if not frame_id:
-            return self.registry.get_active_session()
-        return self.registry.get_session_from_frame(frame_id)
-    async def interact(self,node:EnhancedNode):
-        session_id = self.registry.get_session_from_frame(node.frame_id)
+    # =========================================================================
+    # Screenshot Capture (Task 1.3)
+    # =========================================================================
 
-        self.send("Some Action",{},session_id=session_id)
-        
+    async def capture_screenshot(
+        self,
+        *,
+        format: str = "jpeg",
+        quality: int = 80,
+        full_page: bool = False,
+        session_id: Optional[str] = None,
+    ) -> str:
+        """
+        Capture a screenshot of the current page.
+
+        Args:
+            format: Image format - "jpeg" or "png".
+            quality: JPEG quality (0-100). Ignored for PNG.
+            full_page: If True, capture the full scrollable page. If False, capture viewport only.
+            session_id: Optional explicit session override.
+
+        Returns:
+            Base64-encoded image string.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        params: Dict[str, Any] = {
+            "format": format,
+        }
+
+        if format == "jpeg":
+            params["quality"] = quality
+
+        if full_page:
+            # captureBeyondViewport captures the full page
+            params["captureBeyondViewport"] = True
+
+        result = await self.send(
+            "Page.captureScreenshot",
+            params,
+            session_id=resolved_session_id,
+        )
+
+        return result.get("data", "")
+
+    # =========================================================================
+    # Scroll Action (Task 1.4)
+    # =========================================================================
+
+    async def scroll(
+        self,
+        *,
+        direction: str = "down",
+        amount: int = 500,
+        x: Optional[float] = None,
+        y: Optional[float] = None,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Scroll the page in the specified direction.
+
+        Args:
+            direction: One of "up", "down", "left", "right".
+            amount: Pixels to scroll.
+            x: X coordinate for scroll origin. Defaults to viewport center.
+            y: Y coordinate for scroll origin. Defaults to viewport center.
+            session_id: Optional explicit session override.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        # Default to center of viewport if not specified
+        if x is None:
+            x = 640.0  # Default viewport width / 2
+        if y is None:
+            y = 360.0  # Default viewport height / 2
+
+        # Calculate delta based on direction
+        delta_x = 0.0
+        delta_y = 0.0
+
+        if direction == "down":
+            delta_y = amount
+        elif direction == "up":
+            delta_y = -amount
+        elif direction == "right":
+            delta_x = amount
+        elif direction == "left":
+            delta_x = -amount
+        else:
+            raise ValueError(f"Invalid scroll direction: {direction}. Use 'up', 'down', 'left', or 'right'.")
+
+        # Send mouseWheel event
+        await self.send(
+            "Input.dispatchMouseEvent",
+            {
+                "type": "mouseWheel",
+                "x": x,
+                "y": y,
+                "deltaX": delta_x,
+                "deltaY": delta_y,
+                "modifiers": 0,
+            },
+            session_id=resolved_session_id,
+        )
+
+    # =========================================================================
+    # Navigation Helpers (Task 1.5)
+    # =========================================================================
+
+    async def go_back(self, *, session_id: Optional[str] = None) -> bool:
+        """
+        Navigate back in browser history.
+
+        Args:
+            session_id: Optional explicit session override.
+
+        Returns:
+            True if navigation was successful, False if no history to go back to.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        # Get navigation history
+        history = await self.send(
+            "Page.getNavigationHistory",
+            {},
+            session_id=resolved_session_id,
+        )
+
+        current_index = history.get("currentIndex", 0)
+        entries = history.get("entries", [])
+
+        if current_index <= 0 or len(entries) <= 1:
+            logger.debug("No history to go back to", extra={"session_id": resolved_session_id})
+            return False
+
+        # Navigate to previous entry
+        previous_entry = entries[current_index - 1]
+        await self.send(
+            "Page.navigateToHistoryEntry",
+            {"entryId": previous_entry["id"]},
+            session_id=resolved_session_id,
+        )
+
+        return True
+
+    async def go_forward(self, *, session_id: Optional[str] = None) -> bool:
+        """
+        Navigate forward in browser history.
+
+        Args:
+            session_id: Optional explicit session override.
+
+        Returns:
+            True if navigation was successful, False if no history to go forward to.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        # Get navigation history
+        history = await self.send(
+            "Page.getNavigationHistory",
+            {},
+            session_id=resolved_session_id,
+        )
+
+        current_index = history.get("currentIndex", 0)
+        entries = history.get("entries", [])
+
+        if current_index >= len(entries) - 1:
+            logger.debug("No history to go forward to", extra={"session_id": resolved_session_id})
+            return False
+
+        # Navigate to next entry
+        next_entry = entries[current_index + 1]
+        await self.send(
+            "Page.navigateToHistoryEntry",
+            {"entryId": next_entry["id"]},
+            session_id=resolved_session_id,
+        )
+
+        return True
+
+    async def refresh(self, *, ignore_cache: bool = False, session_id: Optional[str] = None) -> None:
+        """
+        Reload the current page.
+
+        Args:
+            ignore_cache: If True, bypass the cache (hard refresh).
+            session_id: Optional explicit session override.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        await self.send(
+            "Page.reload",
+            {"ignoreCache": ignore_cache},
+            session_id=resolved_session_id,
+        )
+
+    async def navigate(
+        self,
+        url: str,
+        *,
+        wait_for_load: bool = True,
+        timeout: float = 15.0,
+        session_id: Optional[str] = None,
+    ) -> None:
+        """
+        Navigate to a URL and optionally wait for the page to load.
+
+        Args:
+            url: The URL to navigate to.
+            wait_for_load: If True, wait for page load to complete.
+            timeout: Maximum time to wait for page load (seconds).
+            session_id: Optional explicit session override.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        await self.send(
+            "Page.navigate",
+            {"url": url},
+            session_id=resolved_session_id,
+        )
+
+        if wait_for_load:
+            await self.wait_for_load(session_id=resolved_session_id, timeout=timeout)
+
+    async def get_current_url(self, *, session_id: Optional[str] = None) -> str:
+        """
+        Get the current page URL.
+
+        Args:
+            session_id: Optional explicit session override.
+
+        Returns:
+            The current URL as a string.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        result = await self.send(
+            "Runtime.evaluate",
+            {"expression": "window.location.href", "returnByValue": True},
+            session_id=resolved_session_id,
+        )
+
+        return result.get("result", {}).get("value", "")
+
+    async def get_page_title(self, *, session_id: Optional[str] = None) -> str:
+        """
+        Get the current page title.
+
+        Args:
+            session_id: Optional explicit session override.
+
+        Returns:
+            The page title as a string.
+        """
+        resolved_session_id = await self._ensure_session_active(session_id)
+
+        result = await self.send(
+            "Runtime.evaluate",
+            {"expression": "document.title", "returnByValue": True},
+            session_id=resolved_session_id,
+        )
+
+        return result.get("result", {}).get("value", "")
+
+    async def close(self) -> None:
+        """
+        Close the WebSocket connection gracefully.
+        """
+        if self.ws:
+            try:
+                await self.ws.close()
+            except Exception as e:
+                logger.debug(f"Error closing WebSocket: {e}")
+            finally:
+                self.ws = None
+
+
 async def test_frame_events():
     """Test function specifically for frame events."""
     ws_url = await get_page_ws_url()
