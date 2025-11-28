@@ -22,13 +22,18 @@ class BrowserState:
     url: str
     title: str
     dom_text: str
-    selector_map: Dict[int, Any]  # Dict[int, SelectorEntry]
+    selector_map: Dict[int, "SelectorEntry"]  # P2-22: Proper type hint
     screenshot_base64: Optional[str] = None
     viewport_width: int = 1280
     viewport_height: int = 720
-    element_count: int = 0
+    # P2-21: Removed element_count field - use property instead
     
-    def get_element(self, index: int) -> Optional[Any]:
+    @property
+    def element_count(self) -> int:
+        """Get the number of actionable elements (P2-21: Now a property)."""
+        return len(self.selector_map)
+    
+    def get_element(self, index: int) -> Optional["SelectorEntry"]:
         """
         Get element metadata by index.
         
@@ -39,10 +44,6 @@ class BrowserState:
             SelectorEntry if found, None otherwise.
         """
         return self.selector_map.get(index)
-    
-    def get_element_count(self) -> int:
-        """Get the number of actionable elements."""
-        return len(self.selector_map)
     
     def to_prompt(self, include_screenshot: bool = False) -> str:
         """
@@ -169,12 +170,15 @@ class AgentHistory:
         self.total_duration_ms += step.duration_ms
     
     def urls(self) -> List[str]:
-        """Get list of all visited URLs."""
-        urls = []
+        """Get list of all visited URLs (P3-37: O(N) using set for deduplication)."""
+        seen: set[str] = set()
+        urls: List[str] = []
         for step in self.steps:
-            if step.url_before and step.url_before not in urls:
+            if step.url_before and step.url_before not in seen:
+                seen.add(step.url_before)
                 urls.append(step.url_before)
-            if step.url_after and step.url_after not in urls:
+            if step.url_after and step.url_after not in seen:
+                seen.add(step.url_after)
                 urls.append(step.url_after)
         return urls
     

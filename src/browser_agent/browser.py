@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import subprocess
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -22,6 +25,11 @@ from browser_agent.core.models import ActionResult, BrowserState
 from browser_agent.core.serialization import SelectorEntry, serialize_dom
 
 logger = logging.getLogger("browser_agent")
+
+
+def _default_user_data_dir() -> str:
+    """Generate a unique user data directory for process isolation."""
+    return os.path.join(tempfile.gettempdir(), f"browser-agent-chrome-{uuid.uuid4().hex[:8]}")
 
 
 @dataclass
@@ -38,7 +46,7 @@ class BrowserConfig:
     network_idle_timeout: float = 0.5
     screenshot_quality: int = 80
     screenshot_format: str = "jpeg"
-    user_data_dir: str = "/tmp/browser-agent-chrome"
+    user_data_dir: str = field(default_factory=_default_user_data_dir)
     debug: bool = False
 
 
@@ -102,6 +110,16 @@ class Browser:
             
             # Wait for Chrome to start and retry connection
             for attempt in range(10):
+                # Check if process is still alive (fail fast if Chrome crashed)
+                if self._chrome_process and self._chrome_process.poll() is not None:
+                    exit_code = self._chrome_process.returncode
+                    self._chrome_process = None
+                    self._launched_chrome = False
+                    raise CDPConnectionError(
+                        f"Chrome process exited unexpectedly with code {exit_code}",
+                        method="Browser.start"
+                    )
+                
                 await asyncio.sleep(0.5)
                 try:
                     ws_url = await get_page_ws_url(
@@ -111,6 +129,8 @@ class Browser:
                     break
                 except CDPConnectionError:
                     if attempt == 9:
+                        # Cleanup on failure (P0-7)
+                        await self._cleanup_chrome_process()
                         raise CDPConnectionError(
                             f"Chrome failed to start after 5 seconds",
                             method="Browser.start"
@@ -118,10 +138,39 @@ class Browser:
         
         # Create and connect CDP client
         self._client = CDPClient(ws_url, debug=self.config.debug)
-        await self._client.connect()
+        try:
+            await self._client.connect()
+        except Exception:
+            # Cleanup on connection failure (P0-7)
+            await self._cleanup_chrome_process()
+            raise
         
         logger.info("Browser session started")
     
+    async def _cleanup_chrome_process(self) -> None:
+        """Cleanup Chrome process without blocking the event loop."""
+        if self._launched_chrome and self._chrome_process:
+            logger.info("Terminating Chrome process...")
+            self._chrome_process.terminate()
+            try:
+                # Use asyncio.to_thread to avoid blocking the event loop (P0-3)
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._chrome_process.wait),
+                    timeout=5.0
+                )
+            except asyncio.TimeoutError:
+                self._chrome_process.kill()
+                # Give it a moment to be killed
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._chrome_process.wait),
+                        timeout=2.0
+                    )
+                except asyncio.TimeoutError:
+                    pass
+            self._chrome_process = None
+            self._launched_chrome = False
+
     async def stop(self) -> None:
         """
         Stop the browser session and cleanup resources.
@@ -130,39 +179,44 @@ class Browser:
             await self._client.close()
             self._client = None
         
-        if self._launched_chrome and self._chrome_process:
-            logger.info("Terminating Chrome process...")
-            self._chrome_process.terminate()
-            try:
-                self._chrome_process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                self._chrome_process.kill()
-            self._chrome_process = None
-            self._launched_chrome = False
+        await self._cleanup_chrome_process()
         
         logger.info("Browser session stopped")
     
     async def _launch_chrome(self) -> None:
         """Launch a Chrome process with CDP debugging enabled."""
-        chrome_paths = [
-            "/usr/bin/google-chrome",
-            "/usr/bin/chromium-browser",
-            "/usr/bin/chromium",
-            "/snap/bin/chromium",
-            "/opt/google/chrome/chrome",
+        # Use shutil.which for cross-platform Chrome detection (P1-10)
+        chrome_names = [
             "google-chrome",
+            "google-chrome-stable",
+            "chromium",
             "chromium-browser",
+            "chrome",
         ]
         
         chrome_executable = None
-        for path in chrome_paths:
-            if os.path.exists(path):
+        for name in chrome_names:
+            path = shutil.which(name)
+            if path:
                 chrome_executable = path
                 break
-            result = subprocess.run(["which", path], capture_output=True)
-            if result.returncode == 0:
-                chrome_executable = path
-                break
+        
+        # Fallback to common paths for systems where shutil.which might not find it
+        if not chrome_executable:
+            fallback_paths = [
+                "/usr/bin/google-chrome",
+                "/usr/bin/chromium-browser",
+                "/usr/bin/chromium",
+                "/snap/bin/chromium",
+                "/opt/google/chrome/chrome",
+                # macOS paths
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+                "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            ]
+            for path in fallback_paths:
+                if os.path.exists(path):
+                    chrome_executable = path
+                    break
         
         if not chrome_executable:
             raise CDPConnectionError(
@@ -302,17 +356,20 @@ class Browser:
         serialized = serialize_dom(self._nodes)
         self._selector_map = serialized.selector_map
         
-        # Get page metadata
-        url = await client.get_current_url()
-        title = await client.get_page_title()
+        # Fetch URL, title, and screenshot concurrently (P1-9)
+        async def get_screenshot_or_none():
+            if include_screenshot:
+                return await client.capture_screenshot(
+                    format=self.config.screenshot_format,
+                    quality=self.config.screenshot_quality,
+                )
+            return None
         
-        # Optionally capture screenshot
-        screenshot = None
-        if include_screenshot:
-            screenshot = await client.capture_screenshot(
-                format=self.config.screenshot_format,
-                quality=self.config.screenshot_quality,
-            )
+        url, title, screenshot = await asyncio.gather(
+            client.get_current_url(),
+            client.get_page_title(),
+            get_screenshot_or_none(),
+        )
         
         self._last_state = BrowserState(
             url=url,
@@ -322,7 +379,6 @@ class Browser:
             screenshot_base64=screenshot,
             viewport_width=self.config.viewport_width,
             viewport_height=self.config.viewport_height,
-            element_count=len(self._selector_map),
         )
         
         return self._last_state

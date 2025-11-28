@@ -73,6 +73,7 @@ class CDPClient:
         self.message_id = 1
         self.pending_message: Dict[int, asyncio.Future] = {}
         self.ws = None
+        self._listen_task: Optional[asyncio.Task] = None
         self.registry = SessionManager()
         self._network_activity: Dict[str, Dict[str, object]] = {}
         self._frame_load_states: Dict[str, bool] = {}
@@ -80,6 +81,7 @@ class CDPClient:
         self._lifecycle_enabled_sessions: Set[str] = set()
         self._main_frames: Dict[str, str] = {}
         self.debug = debug
+        self._recovery_in_progress = False
         self._retry_config = {
             "max_attempts": 3,
             "initial_delay": 0.1,
@@ -195,8 +197,12 @@ class CDPClient:
         
         target_id = session_info.target_id
         
+        # Set flag to bypass _ensure_session_active during recovery
+        self._recovery_in_progress = True
+        
         try:
-            targets_result = await self.send("Target.getTargets", {})
+            # Use _send_internal directly to bypass session checks for browser-level commands
+            targets_result = await self._send_internal("Target.getTargets", {})
             target_infos = targets_result.get("targetInfos", [])
             
             target_exists = any(t.get("targetId") == target_id for t in target_infos)
@@ -208,7 +214,7 @@ class CDPClient:
                     method="_recover_session"
                 )
             
-            res = await self.send("Target.attachToTarget", {
+            res = await self._send_internal("Target.attachToTarget", {
                 "targetId": target_id,
                 "flatten": True
             })
@@ -217,11 +223,15 @@ class CDPClient:
             self.registry.add_session(new_session_id, target_id)
             self.registry.set_active_session(new_session_id)
             
-            await self.enable_domains(["DOM", "Page", "Network", "Runtime"], new_session_id)
+            # Enable domains using _send_internal to bypass session checks
+            for domain in ["DOM", "Page", "Network", "Runtime"]:
+                if not self.registry.is_domain_enabled(new_session_id, domain):
+                    await self._send_internal(f"{domain}.enable", {}, new_session_id)
+                    self.registry.mark_domain_enabled(new_session_id, domain)
             
             if old_session_id in self._lifecycle_enabled_sessions:
                 try:
-                    await self.send("Page.setLifecycleEventsEnabled", {"enabled": True}, session_id=new_session_id)
+                    await self._send_internal("Page.setLifecycleEventsEnabled", {"enabled": True}, new_session_id)
                     self._lifecycle_enabled_sessions.add(new_session_id)
                     self._lifecycle_enabled_sessions.discard(old_session_id)
                 except Exception:
@@ -242,6 +252,8 @@ class CDPClient:
                 target_id=target_id,
                 method="_recover_session"
             ) from e
+        finally:
+            self._recovery_in_progress = False
 
     def _get_network_state(self, session_id: str) -> Dict[str, object]:
         state = self._network_activity.get(session_id)
@@ -360,7 +372,7 @@ class CDPClient:
                 method="connect"
             ) from e
         
-        asyncio.create_task(self.listen())
+        self._listen_task = asyncio.create_task(self.listen())
         
         try:
             await self.send("Target.setAutoAttach", {
@@ -1053,9 +1065,29 @@ class CDPClient:
                     },
                 )
 
-        x, y = node.click_point
-        x_float = float(x)
-        y_float = float(y)
+        # P1-16: Recalculate coordinates after scroll to handle sticky headers/moving elements
+        x_float, y_float = float(node.click_point[0]), float(node.click_point[1])
+        try:
+            box_model = await self.send(
+                "DOM.getBoxModel",
+                {"backendNodeId": backend_node_id},
+                session_id=resolved_session_id,
+            )
+            content = box_model.get("model", {}).get("content", [])
+            if len(content) >= 6:
+                # content is [x1, y1, x2, y2, x3, y3, x4, y4] - corners of the quad
+                # Calculate center from the quad corners
+                x_float = (content[0] + content[2] + content[4] + content[6]) / 4
+                y_float = (content[1] + content[3] + content[5] + content[7]) / 4
+        except BrowserAgentError as exc:
+            logger.debug(
+                "DOM.getBoxModel failed, using original click point",
+                extra={
+                    "session_id": resolved_session_id,
+                    "backend_node_id": backend_node_id,
+                    "error_type": type(exc).__name__,
+                },
+            )
 
         if move_before_click:
             await self.send(
@@ -1491,6 +1523,18 @@ class CDPClient:
         """
         Close the WebSocket connection gracefully.
         """
+        # Cancel the listen task first
+        if self._listen_task:
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                logger.debug(f"Error awaiting listen task: {e}")
+            finally:
+                self._listen_task = None
+        
         if self.ws:
             try:
                 await self.ws.close()

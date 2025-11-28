@@ -7,7 +7,8 @@ This module provides:
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Literal, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Coroutine, Dict, List, Literal, Optional, Union
 
 from browser_agent.browser import Browser
 from browser_agent.core.models import ActionResult
@@ -243,26 +244,17 @@ def get_tool_schemas(
 # Tool Executor
 # =============================================================================
 
+@dataclass
 class ToolExecutionResult:
-    """Result of executing a tool."""
+    """Result of executing a tool (P2-25: Converted to dataclass)."""
     
-    def __init__(
-        self,
-        success: bool,
-        tool_name: str,
-        result: Optional[ActionResult] = None,
-        error: Optional[str] = None,
-        is_done: bool = False,
-        done_message: Optional[str] = None,
-        extracted_data: Optional[str] = None,
-    ):
-        self.success = success
-        self.tool_name = tool_name
-        self.result = result
-        self.error = error
-        self.is_done = is_done
-        self.done_message = done_message
-        self.extracted_data = extracted_data
+    success: bool
+    tool_name: str
+    result: Optional[ActionResult] = None
+    error: Optional[str] = None
+    is_done: bool = False
+    done_message: Optional[str] = None
+    extracted_data: Optional[str] = None
     
     def to_message(self) -> str:
         """Format for LLM consumption."""
@@ -275,6 +267,115 @@ class ToolExecutionResult:
         return f"✓ {self.tool_name} executed"
 
 
+# P2-24: Tool handler type for dynamic dispatch
+ToolHandler = Callable[[Browser, Dict[str, Any]], Coroutine[Any, Any, ToolExecutionResult]]
+
+
+async def _handle_click(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    index = args.get("index")
+    if index is None:
+        return ToolExecutionResult(False, "click", error="Missing required parameter: index")
+    result = await browser.click(index)
+    return ToolExecutionResult(result.success, "click", result=result)
+
+
+async def _handle_type(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    index = args.get("index")
+    text = args.get("text")
+    if index is None or text is None:
+        return ToolExecutionResult(False, "type", error="Missing required parameters: index, text")
+    clear_existing = args.get("clear_existing", True)
+    result = await browser.type(index, text, clear_existing=clear_existing)
+    return ToolExecutionResult(result.success, "type", result=result)
+
+
+async def _handle_scroll(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    direction = args.get("direction", "down")
+    amount = args.get("amount", 500)
+    result = await browser.scroll(direction=direction, amount=amount)
+    return ToolExecutionResult(result.success, "scroll", result=result)
+
+
+async def _handle_navigate(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    url = args.get("url")
+    if not url:
+        return ToolExecutionResult(False, "navigate", error="Missing required parameter: url")
+    result = await browser.navigate(url)
+    return ToolExecutionResult(result.success, "navigate", result=result)
+
+
+async def _handle_go_back(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    result = await browser.go_back()
+    return ToolExecutionResult(result.success, "go_back", result=result)
+
+
+async def _handle_go_forward(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    result = await browser.go_forward()
+    return ToolExecutionResult(result.success, "go_forward", result=result)
+
+
+async def _handle_refresh(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    result = await browser.refresh()
+    return ToolExecutionResult(result.success, "refresh", result=result)
+
+
+async def _handle_select(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    index = args.get("index")
+    value = args.get("value")
+    if index is None or value is None:
+        return ToolExecutionResult(False, "select", error="Missing required parameters: index, value")
+    by = args.get("by", "value")
+    result = await browser.select(index, value, by=by)
+    return ToolExecutionResult(result.success, "select", result=result)
+
+
+async def _handle_press_key(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    key = args.get("key")
+    if not key:
+        return ToolExecutionResult(False, "press_key", error="Missing required parameter: key")
+    modifiers = args.get("modifiers", [])
+    result = await browser.press_key(key, modifiers=modifiers)
+    return ToolExecutionResult(result.success, "press_key", result=result)
+
+
+async def _handle_screenshot(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    full_page = args.get("full_page", False)
+    screenshot = await browser.screenshot(full_page=full_page)
+    return ToolExecutionResult(
+        True, 
+        "screenshot", 
+        result=ActionResult.ok("screenshot", extracted_content=f"Screenshot captured ({len(screenshot)} bytes)")
+    )
+
+
+async def _handle_done(browser: Browser, args: Dict[str, Any]) -> ToolExecutionResult:
+    message = args.get("message", "Task completed")
+    extracted_data = args.get("extracted_data")
+    return ToolExecutionResult(
+        True,
+        "done",
+        is_done=True,
+        done_message=message,
+        extracted_data=extracted_data,
+    )
+
+
+# P2-24: Tool handler registry for O(1) dispatch
+TOOL_HANDLERS: Dict[str, ToolHandler] = {
+    "click": _handle_click,
+    "type": _handle_type,
+    "scroll": _handle_scroll,
+    "navigate": _handle_navigate,
+    "go_back": _handle_go_back,
+    "go_forward": _handle_go_forward,
+    "refresh": _handle_refresh,
+    "select": _handle_select,
+    "press_key": _handle_press_key,
+    "screenshot": _handle_screenshot,
+    "done": _handle_done,
+}
+
+
 async def execute_tool(
     browser: Browser,
     tool_name: str,
@@ -282,6 +383,8 @@ async def execute_tool(
 ) -> ToolExecutionResult:
     """
     Execute a tool call against the browser.
+    
+    P2-24: Uses handler registry for O(1) dispatch instead of if/elif chain.
     
     Args:
         browser: Browser instance to execute against.
@@ -292,87 +395,10 @@ async def execute_tool(
         ToolExecutionResult with the outcome.
     """
     try:
-        if tool_name == "click":
-            index = tool_args.get("index")
-            if index is None:
-                return ToolExecutionResult(False, tool_name, error="Missing required parameter: index")
-            result = await browser.click(index)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "type":
-            index = tool_args.get("index")
-            text = tool_args.get("text")
-            if index is None or text is None:
-                return ToolExecutionResult(False, tool_name, error="Missing required parameters: index, text")
-            clear_existing = tool_args.get("clear_existing", True)
-            result = await browser.type(index, text, clear_existing=clear_existing)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "scroll":
-            direction = tool_args.get("direction", "down")
-            amount = tool_args.get("amount", 500)
-            result = await browser.scroll(direction=direction, amount=amount)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "navigate":
-            url = tool_args.get("url")
-            if not url:
-                return ToolExecutionResult(False, tool_name, error="Missing required parameter: url")
-            result = await browser.navigate(url)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "go_back":
-            result = await browser.go_back()
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "go_forward":
-            result = await browser.go_forward()
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "refresh":
-            result = await browser.refresh()
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "select":
-            index = tool_args.get("index")
-            value = tool_args.get("value")
-            if index is None or value is None:
-                return ToolExecutionResult(False, tool_name, error="Missing required parameters: index, value")
-            by = tool_args.get("by", "value")
-            result = await browser.select(index, value, by=by)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "press_key":
-            key = tool_args.get("key")
-            if not key:
-                return ToolExecutionResult(False, tool_name, error="Missing required parameter: key")
-            modifiers = tool_args.get("modifiers", [])
-            result = await browser.press_key(key, modifiers=modifiers)
-            return ToolExecutionResult(result.success, tool_name, result=result)
-        
-        elif tool_name == "screenshot":
-            full_page = tool_args.get("full_page", False)
-            screenshot = await browser.screenshot(full_page=full_page)
-            return ToolExecutionResult(
-                True, 
-                tool_name, 
-                result=ActionResult.ok("screenshot", extracted_content=f"Screenshot captured ({len(screenshot)} bytes)")
-            )
-        
-        elif tool_name == "done":
-            message = tool_args.get("message", "Task completed")
-            extracted_data = tool_args.get("extracted_data")
-            return ToolExecutionResult(
-                True,
-                tool_name,
-                is_done=True,
-                done_message=message,
-                extracted_data=extracted_data,
-            )
-        
-        else:
+        handler = TOOL_HANDLERS.get(tool_name)
+        if handler is None:
             return ToolExecutionResult(False, tool_name, error=f"Unknown tool: {tool_name}")
-    
+        return await handler(browser, tool_args)
     except Exception as e:
         return ToolExecutionResult(False, tool_name, error=str(e))
 

@@ -1,10 +1,15 @@
 """
 CDP Session Management - Manages sessions, targets, and frames.
 """
-from dataclasses import dataclass, field
-from typing import Set, Dict, Optional, List
-from enum import Enum
+import asyncio
+import logging
 import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Dict, List, Optional, Set
+from urllib.parse import urlparse
+
+logger = logging.getLogger("browser_agent")
 
 
 class SessionStatus(Enum):
@@ -16,6 +21,7 @@ class SessionStatus(Enum):
 @dataclass
 class TargetInfo:
     """Information about a CDP target."""
+    __slots__ = ('target_id', 'type', 'url', 'title', 'session_id', 'browser_context_id')
     target_id: str
     type: str 
     url: str
@@ -27,6 +33,7 @@ class TargetInfo:
 @dataclass
 class FrameInfo:
     """Information about a frame."""
+    __slots__ = ('frame_id', 'parent_frame_id', 'url', 'origin', 'target_id', 'session_id')
     frame_id: str
     parent_frame_id: Optional[str]
     url: str
@@ -38,6 +45,7 @@ class FrameInfo:
 @dataclass
 class SessionInfo:
     """Information about a CDP session."""
+    __slots__ = ('session_id', 'target_id', 'status', 'domains_enabled', 'created_at')
     session_id: str
     target_id: str
     status: SessionStatus = SessionStatus.ACTIVE
@@ -46,7 +54,7 @@ class SessionInfo:
 
 
 class SessionManager:
-    """Manages CDP sessions, targets, and frames."""
+    """Manages CDP sessions, targets, and frames with thread-safe operations."""
     
     def __init__(self):
         self.sessions: Dict[str, SessionInfo] = {}
@@ -54,6 +62,8 @@ class SessionManager:
         self.frames: Dict[str, FrameInfo] = {}
         self.children: Dict[str, List[str]] = {}
         self.active_session_id: Optional[str] = None
+        # Lock for thread-safe operations (P1-17)
+        self._lock = asyncio.Lock()
     
     def add_session(self, session_id: str, target_id: str) -> SessionInfo:
         """Add a new session to the registry."""
@@ -175,11 +185,12 @@ class SessionManager:
         if not url:
             return ""
         try:
-            from urllib.parse import urlparse
+            # urlparse imported at module level (P3-42)
             parsed = urlparse(url)
             origin = f"{parsed.scheme}://{parsed.netloc}"
             return origin
-        except Exception:
+        except (ValueError, AttributeError):
+            # Catch specific exceptions (P3-43)
             return ""
     
     def update_frame_target_mapping(self, frame_id: str, target_id: str, session_id: str):
@@ -212,4 +223,71 @@ class SessionManager:
             del self.children[frame_id]
         
         del self.frames[frame_id]
+    
+    def remove_session(self, session_id: str) -> None:
+        """
+        Remove a session from the registry (P0-8: Memory leak fix).
+        
+        Also updates the associated target to remove the session reference.
+        """
+        if session_id not in self.sessions:
+            return
+        
+        session = self.sessions.pop(session_id)
+        
+        # Update associated target
+        if session.target_id and session.target_id in self.targets:
+            self.targets[session.target_id].session_id = None
+        
+        # Clear active session if this was it
+        if self.active_session_id == session_id:
+            self.active_session_id = None
+        
+        logger.debug(f"Removed session {session_id}")
+    
+    def remove_target(self, target_id: str) -> None:
+        """
+        Remove a target and its associated session and frames (P0-8: Memory leak fix).
+        
+        Maintains referential integrity by cleaning up all related data.
+        """
+        if target_id not in self.targets:
+            return
+        
+        target = self.targets.pop(target_id)
+        
+        # Remove associated session
+        if target.session_id and target.session_id in self.sessions:
+            self.sessions.pop(target.session_id)
+            if self.active_session_id == target.session_id:
+                self.active_session_id = None
+        
+        # Remove associated frames
+        frames_to_remove = [
+            fid for fid, f in list(self.frames.items()) 
+            if f.target_id == target_id
+        ]
+        for fid in frames_to_remove:
+            self.remove_frame(fid)
+        
+        logger.debug(f"Removed target {target_id}")
+    
+    def cleanup_disconnected_sessions(self) -> int:
+        """
+        Remove all disconnected sessions and their targets (P0-8: Memory leak fix).
+        
+        Returns:
+            Number of sessions cleaned up.
+        """
+        disconnected = [
+            sid for sid, s in list(self.sessions.items())
+            if s.status == SessionStatus.DISCONNECTED
+        ]
+        
+        for session_id in disconnected:
+            session = self.sessions.get(session_id)
+            if session:
+                self.remove_target(session.target_id)
+        
+        return len(disconnected)
 

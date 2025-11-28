@@ -172,66 +172,71 @@ class Agent:
                     
                     # Handle response
                     if response.has_tool_calls:
-                        # Execute only the FIRST tool call for safety
-                        # (subsequent tools may reference stale state after navigation)
-                        tool_call = response.tool_calls[0]
+                        # P1-18: Execute multiple tool calls, but stop on navigation/state-changing actions
+                        # Navigation tools that should trigger a state refresh after execution
+                        navigation_tools = {"navigate", "click", "go_back", "go_forward", "refresh"}
                         
-                        if len(response.tool_calls) > 1 and self.config.verbose:
-                            logger.warning(
-                                f"LLM returned {len(response.tool_calls)} tool calls, "
-                                f"executing only the first: {tool_call.name}"
+                        for tool_idx, tool_call in enumerate(response.tool_calls):
+                            result = await execute_tool(
+                                browser,
+                                tool_call.name,
+                                tool_call.arguments,
                             )
-                        
-                        result = await execute_tool(
-                            browser,
-                            tool_call.name,
-                            tool_call.arguments,
-                        )
-                        
-                        # Record step
-                        step = AgentStep(
-                            step_number=step_num,
-                            action_type=tool_call.name,
-                            action_params=tool_call.arguments,
-                            result=result.result,
-                            url_before=state.url,
-                            duration_ms=(time.time() - step_start) * 1000,
-                        )
-                        history.add_step(step)
-                        
-                        # Add to action history (with proper JSON serialization)
-                        action_history.append({
-                            "tool_call": {
-                                "id": tool_call.id,
-                                "name": tool_call.name,
-                                "arguments": tool_call.arguments,
-                            },
-                            "result": result.to_message(),
-                        })
+                            
+                            # Record step
+                            step = AgentStep(
+                                step_number=step_num,
+                                action_type=tool_call.name,
+                                action_params=tool_call.arguments,
+                                result=result.result,
+                                url_before=state.url,
+                                duration_ms=(time.time() - step_start) * 1000,
+                            )
+                            history.add_step(step)
+                            
+                            # Add to action history (with proper JSON serialization)
+                            action_history.append({
+                                "tool_call": {
+                                    "id": tool_call.id,
+                                    "name": tool_call.name,
+                                    "arguments": tool_call.arguments,
+                                },
+                                "result": result.to_message(),
+                            })
+                            
+                            if self.config.verbose:
+                                logger.info(f"  {result.to_message()}")
+                            
+                            # Check if done (only via the done tool, not text matching)
+                            if result.is_done:
+                                history.is_complete = True
+                                history.final_result = result.done_message
+                                history.total_duration_ms = (time.time() - start_time) * 1000
+                                return history
+                            
+                            # Track failures
+                            if result.result and not result.result.success:
+                                consecutive_failures += 1
+                                if consecutive_failures >= self.config.max_failures:
+                                    history.final_result = f"Stopped after {consecutive_failures} consecutive failures"
+                                    history.total_duration_ms = (time.time() - start_time) * 1000
+                                    return history
+                            else:
+                                consecutive_failures = 0
+                            
+                            # P1-18: Stop executing more tools if this was a navigation action
+                            # (subsequent tools may reference stale state)
+                            if tool_call.name in navigation_tools:
+                                if tool_idx < len(response.tool_calls) - 1 and self.config.verbose:
+                                    remaining = len(response.tool_calls) - tool_idx - 1
+                                    logger.info(
+                                        f"  Skipping {remaining} remaining tool calls after navigation action"
+                                    )
+                                break
                         
                         # Prune action history to prevent context overflow
                         if len(action_history) > self.config.max_history_actions:
                             action_history = action_history[-self.config.max_history_actions:]
-                        
-                        if self.config.verbose:
-                            logger.info(f"  {result.to_message()}")
-                        
-                        # Check if done (only via the done tool, not text matching)
-                        if result.is_done:
-                            history.is_complete = True
-                            history.final_result = result.done_message
-                            history.total_duration_ms = (time.time() - start_time) * 1000
-                            return history
-                        
-                        # Track failures
-                        if result.result and not result.result.success:
-                            consecutive_failures += 1
-                            if consecutive_failures >= self.config.max_failures:
-                                history.final_result = f"Stopped after {consecutive_failures} consecutive failures"
-                                history.total_duration_ms = (time.time() - start_time) * 1000
-                                return history
-                        else:
-                            consecutive_failures = 0
                     
                     elif response.content:
                         # LLM responded with text instead of tool call

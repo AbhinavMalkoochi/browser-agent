@@ -5,6 +5,32 @@ Enhanced Node Merger - Transforms raw CDP data into actionable browser elements.
 from dataclasses import dataclass
 from typing import List, Dict, Optional, Tuple, Any
 
+# P2-23: Module-level constants for interactive element detection
+INTERACTIVE_TAGS = frozenset({
+    'button', 'a', 'input', 'select', 'textarea', 'details', 'summary'
+})
+
+INTERACTIVE_ROLES = frozenset({
+    'button', 'link', 'textbox', 'combobox', 'checkbox', 'radio', 
+    'tab', 'menuitem', 'option', 'switch', 'searchbox', 'listbox'
+})
+
+EVENT_ATTRS = frozenset({
+    'onclick', 'onmousedown', 'onmouseup', 'onkeydown', 'onkeyup'
+})
+
+INPUT_TYPES_TEXT = frozenset({
+    'text', 'email', 'password', 'search', 'url', 'tel'
+})
+
+INPUT_TYPES_TOGGLE = frozenset({
+    'checkbox', 'radio'
+})
+
+INPUT_TYPES_CLICK = frozenset({
+    'button', 'submit', 'reset'
+})
+
 @dataclass
 class EnhancedNode:
     """Unified representation of a browser element with action metadata."""
@@ -147,37 +173,48 @@ class BrowserDataMerger:
                 }
         return lookup
     
-    def _traverse_dom_and_merge(self, node: dict, snapshot_lookup: dict, 
+    def _traverse_dom_and_merge(self, root_node: dict, snapshot_lookup: dict, 
                                ax_lookup: dict, enhanced_nodes: list, frame_id: str = None):
-        """Recursively traverse DOM tree and merge with snapshot/AX data."""
+        """
+        Iteratively traverse DOM tree and merge with snapshot/AX data.
         
-        # Update frame_id if we encounter a frame owner
-        if node.get('frameId'):
-            frame_id = node.get('frameId')
-
-        node_type = node.get('nodeType', 0)
+        Uses a stack-based approach instead of recursion to avoid hitting
+        Python's recursion limit on deep DOM trees (P0-5).
+        """
+        # Stack holds tuples of (node, frame_id)
+        stack = [(root_node, frame_id)]
         
-        if node_type == 1: # Element node
-            backend_id = node.get('backendNodeId')
-            if backend_id and backend_id in snapshot_lookup:
-                enhanced_node = self._create_enhanced_node(
-                    node, snapshot_lookup[backend_id], ax_lookup.get(backend_id, {}), frame_id
-                )
-                if enhanced_node:
-                    enhanced_nodes.append(enhanced_node)
-        
-        # Recurse children
-        for child in node.get('children', []):
-            self._traverse_dom_and_merge(child, snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
+        while stack:
+            node, current_frame_id = stack.pop()
             
-        # Handle contentDocument (Iframes/Frames)
-        if 'contentDocument' in node:
-            self._traverse_dom_and_merge(node['contentDocument'], snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
-        
-        # Handle Shadow Roots
-        if 'shadowRoots' in node:
-            for root in node['shadowRoots']:
-                self._traverse_dom_and_merge(root, snapshot_lookup, ax_lookup, enhanced_nodes, frame_id)
+            # Update frame_id if we encounter a frame owner
+            if node.get('frameId'):
+                current_frame_id = node.get('frameId')
+
+            node_type = node.get('nodeType', 0)
+            
+            if node_type == 1:  # Element node
+                backend_id = node.get('backendNodeId')
+                if backend_id and backend_id in snapshot_lookup:
+                    enhanced_node = self._create_enhanced_node(
+                        node, snapshot_lookup[backend_id], ax_lookup.get(backend_id, {}), current_frame_id
+                    )
+                    if enhanced_node:
+                        enhanced_nodes.append(enhanced_node)
+            
+            # Add children to stack in reverse order to maintain traversal order
+            children = node.get('children', [])
+            for child in reversed(children):
+                stack.append((child, current_frame_id))
+            
+            # Handle contentDocument (Iframes/Frames)
+            if 'contentDocument' in node:
+                stack.append((node['contentDocument'], current_frame_id))
+            
+            # Handle Shadow Roots
+            if 'shadowRoots' in node:
+                for root in reversed(node['shadowRoots']):
+                    stack.append((root, current_frame_id))
 
     def _create_enhanced_node(self, dom_node: dict, snapshot_data: dict, ax_data: dict, frame_id: str) -> Optional[EnhancedNode]:
         backend_id = dom_node.get('backendNodeId')
@@ -197,7 +234,7 @@ class BrowserDataMerger:
         computed_styles = snapshot_data.get('computed_styles', {})
         
         is_visible = self._is_element_visible(bounds_css, computed_styles)
-        is_interactive = self._is_element_interactive(tag_name, attributes, ax_data)
+        is_interactive = self._is_element_interactive(tag_name, attributes, ax_data, computed_styles)
         is_clickable = self._is_element_clickable(tag_name, attributes, ax_data, computed_styles)
         is_focusable = ax_data.get('properties', {}).get('focusable', False)
         
@@ -231,6 +268,8 @@ class BrowserDataMerger:
     def _apply_occlusion_detection(self, nodes: List[EnhancedNode]):
         """
         Detects if elements are covered by other elements using Paint Order.
+        
+        P1-13: Improved to check intersection area and respect pointer-events: none.
         This is an O(N^2) operation on the node list, but N is usually small (<500).
         """
         # Sort by paint order descending (top-most elements first)
@@ -244,29 +283,52 @@ class BrowserDataMerger:
         for target_node in nodes:
             if not target_node.is_visible:
                 continue
-                
-            tx, ty = target_node.click_point
             
+            tx, ty, tw, th = target_node.bounds_css
+            target_area = tw * th
+            if target_area <= 0:
+                continue
+                
             # Check against all nodes that are painted AFTER (on top of) the target
             for obstacle in sorted_by_paint:
                 # If we reached the target node itself or a layer below it, stop checking
                 if obstacle.paint_order <= target_node.paint_order:
                     break
                 
-                # Don't let a parent occlude its own child (common in DOM structures)
-                # In a flat list, this is hard to detect perfectly without tree traversal,
-                # but usually parents have LOWER paint order than children.
-                # If a separate element (like a modal) covers it, it will have higher paint order.
+                # P1-13: Skip obstacles with pointer-events: none (they don't block clicks)
+                if obstacle.computed_styles.get('pointer-events') == 'none':
+                    continue
+                
+                # Skip transparent obstacles (opacity < 0.1)
+                try:
+                    opacity = float(obstacle.computed_styles.get('opacity', '1'))
+                    if opacity < 0.1:
+                        continue
+                except (ValueError, TypeError):
+                    pass
                 
                 ox, oy, owidth, oheight = obstacle.bounds_css
                 
-                # Check if target's center point is inside the obstacle
-                if (ox <= tx <= ox + owidth) and (oy <= ty <= oy + oheight):
-                    # It is covered.
-                    target_node.is_occluded = True
-                    target_node.is_clickable = False # Force unclickable
-                    target_node.confidence_score *= 0.1 # Heavily penalize
-                    break
+                # P1-13: Calculate intersection area instead of just center point
+                # This prevents false negatives where element is 90% covered but center is visible
+                ix = max(tx, ox)
+                iy = max(ty, oy)
+                ix2 = min(tx + tw, ox + owidth)
+                iy2 = min(ty + th, oy + oheight)
+                
+                if ix < ix2 and iy < iy2:
+                    intersection_area = (ix2 - ix) * (iy2 - iy)
+                    coverage_ratio = intersection_area / target_area
+                    
+                    # Consider occluded if >90% covered
+                    if coverage_ratio > 0.9:
+                        target_node.is_occluded = True
+                        target_node.is_clickable = False
+                        target_node.confidence_score *= 0.1
+                        break
+                    # Partial occlusion penalty
+                    elif coverage_ratio > 0.5:
+                        target_node.confidence_score *= (1 - coverage_ratio * 0.5)
 
     def _extract_text_content(self, dom_node: dict) -> str:
         text_parts = []
@@ -307,25 +369,47 @@ class BrowserDataMerger:
         
         return True
     
-    def _is_element_interactive(self, tag_name: str, attributes: dict, ax_data: dict) -> bool:
-        interactive_tags = {'button', 'a', 'input', 'select', 'textarea', 'details', 'summary'}
-        if tag_name in interactive_tags:
+    def _is_element_interactive(self, tag_name: str, attributes: dict, ax_data: dict, 
+                                  computed_styles: dict = None) -> bool:
+        """
+        Determine if an element is interactive.
+        
+        P1-12: Enhanced to better detect modern framework elements (React, Vue, etc.)
+        by relying more on computed styles rather than just inline event attributes.
+        """
+        computed_styles = computed_styles or {}
+        
+        # Check computed styles first (P1-12: Trust cursor: pointer for React/Vue elements)
+        cursor = computed_styles.get('cursor', '')
+        if cursor == 'pointer':
             return True
         
-        event_attrs = {'onclick', 'onmousedown', 'onmouseup', 'onkeydown', 'onkeyup'}
-        if any(attr in attributes for attr in event_attrs):
+        # Check if pointer-events: none (definitely not interactive)
+        pointer_events = computed_styles.get('pointer-events', '')
+        if pointer_events == 'none':
+            return False
+        
+        # Use module-level constants (P2-23)
+        if tag_name in INTERACTIVE_TAGS:
+            return True
+        
+        if any(attr in attributes for attr in EVENT_ATTRS):
             return True
         
         role = attributes.get('role', '').lower()
-        interactive_roles = {'button', 'link', 'textbox', 'combobox', 'checkbox', 'radio', 'tab', 'menuitem'}
-        if role in interactive_roles:
+        if role in INTERACTIVE_ROLES:
             return True
         
         ax_role = ax_data.get('role', '').lower()
-        if ax_role in interactive_roles:
+        if ax_role in INTERACTIVE_ROLES:
             return True
         
         if ax_data.get('properties', {}).get('focusable'):
+            return True
+        
+        # Check for tabindex (makes element focusable/interactive)
+        tabindex = attributes.get('tabindex', '')
+        if tabindex and tabindex != '-1':
             return True
         
         return False
@@ -358,16 +442,17 @@ class BrowserDataMerger:
         return True
     
     def _determine_action_type(self, tag_name: str, attributes: dict, ax_data: dict) -> str:
+        # Use module-level constants (P2-23)
         if tag_name == 'input':
             input_type = attributes.get('type', 'text').lower()
-            if input_type in {'text', 'email', 'password', 'search', 'url', 'tel'}:
+            if input_type in INPUT_TYPES_TEXT:
                 return 'input'
-            elif input_type in {'checkbox', 'radio'}:
+            elif input_type in INPUT_TYPES_TOGGLE:
                 return 'toggle'
-            elif input_type in {'button', 'submit', 'reset'}:
+            elif input_type in INPUT_TYPES_CLICK:
                 return 'click'
         
-        if tag_name in {'textarea'}:
+        if tag_name == 'textarea':
             return 'input'
         
         if tag_name == 'select':

@@ -124,6 +124,17 @@ class OpenAIBackend:
         except Exception as e:
             logger.error(f"OpenAI API error: {e}")
             raise
+    
+    async def close(self) -> None:
+        """Close the underlying HTTP client (P1-20)."""
+        if hasattr(self.client, 'close'):
+            await self.client.close()
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 # =============================================================================
@@ -288,6 +299,13 @@ class AnthropicBackend:
         # Join system prompts with newlines
         system_prompt = "\n\n".join(system_parts)
         
+        # Ensure first message is user role (P1-19: Anthropic requires this)
+        if anthropic_messages and anthropic_messages[0]["role"] != "user":
+            anthropic_messages.insert(0, {
+                "role": "user",
+                "content": "Please proceed with the task."
+            })
+        
         return system_prompt, anthropic_messages
     
     def _append_or_merge(
@@ -387,6 +405,17 @@ class AnthropicBackend:
         except Exception as e:
             logger.error(f"Anthropic API error: {e}")
             raise
+    
+    async def close(self) -> None:
+        """Close the underlying HTTP client (P1-20)."""
+        if hasattr(self.client, 'close'):
+            await self.client.close()
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 # =============================================================================
@@ -455,6 +484,7 @@ class GeminiBackend:
         - System message concatenation
         - Role merging for consecutive same-role messages
         - Tool response grouping
+        - Proper tool_call_id to function_name mapping (P0-2 fix)
         
         Returns:
             Tuple of (system_instruction, contents)
@@ -462,6 +492,18 @@ class GeminiBackend:
         types = self._types
         system_parts: List[str] = []
         contents: List[Any] = []
+        
+        # Build tool_call_id -> function_name mapping first (P0-2 fix)
+        # This is needed because Gemini requires the function name for tool responses,
+        # but OpenAI's tool messages only contain tool_call_id and content
+        tool_call_id_to_name: Dict[str, str] = {}
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id", "")
+                    func_name = tc.get("function", {}).get("name", "")
+                    if tc_id and func_name:
+                        tool_call_id_to_name[tc_id] = func_name
         
         # Track pending tool responses to group them
         pending_tool_responses: List[Any] = []
@@ -530,8 +572,14 @@ class GeminiBackend:
             elif role == "tool":
                 # Collect tool responses - they'll be flushed together
                 tool_call_id = msg.get("tool_call_id", "")
-                # Extract function name from tool_call_id
-                func_name = tool_call_id.split("_")[0] if "_" in tool_call_id else "unknown"
+                # Look up the actual function name from our mapping (P0-2 fix)
+                func_name = tool_call_id_to_name.get(tool_call_id, "unknown")
+                
+                if func_name == "unknown":
+                    logger.warning(
+                        f"Could not find function name for tool_call_id: {tool_call_id}. "
+                        "This may cause Gemini API errors."
+                    )
                 
                 pending_tool_responses.append(
                     types.Part.from_function_response(
@@ -648,6 +696,17 @@ class GeminiBackend:
         except Exception as e:
             logger.error(f"Gemini API error: {e}")
             raise
+    
+    async def close(self) -> None:
+        """Close the underlying HTTP client (P1-20)."""
+        # Gemini client may not have an async close method
+        pass
+    
+    async def __aenter__(self):
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
 
 
 # =============================================================================
