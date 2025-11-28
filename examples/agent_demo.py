@@ -67,8 +67,8 @@ async def main():
     
     print("Running agent with task: 'Explore the page'\n")
     history = await agent.run(
-        task="Explore the page",
-        start_url="https://example.com"
+        task="In this website, go to the signup page and extract the info from the website",
+        start_url="https://enkymarketing.com"
     )
     
     # Print results

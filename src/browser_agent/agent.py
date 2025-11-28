@@ -346,16 +346,46 @@ class Agent:
                 })
         
         # Add current browser state (always fresh, not from history)
+        # Include screenshot as vision content if available
+        state_content = self._format_state_content(current_state)
         messages.append({
             "role": "user",
-            "content": self._format_state_message(current_state),
+            "content": state_content,
         })
         
         return messages
     
+    def _format_state_content(self, state: BrowserState) -> Any:
+        """
+        Format browser state for the LLM, including screenshot as vision content.
+        
+        Returns either a string (text-only) or a list of content blocks (with image).
+        """
+        text_content = f"Current browser state:\n\n{state.to_prompt(include_screenshot=False)}"
+        
+        # If screenshot is available and configured, include it as vision content
+        if self.config.include_screenshot_in_state and state.screenshot_base64:
+            # Return multimodal content for vision models
+            return [
+                {
+                    "type": "text",
+                    "text": text_content,
+                },
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/jpeg;base64,{state.screenshot_base64}",
+                        "detail": "high",  # Use high detail for better element recognition
+                    }
+                }
+            ]
+        
+        # Text-only content
+        return text_content
+    
     def _format_state_message(self, state: BrowserState) -> str:
-        """Format browser state for the LLM."""
-        return f"Current browser state:\n\n{state.to_prompt(include_screenshot=self.config.include_screenshot_in_state)}"
+        """Format browser state for the LLM (text-only version)."""
+        return f"Current browser state:\n\n{state.to_prompt(include_screenshot=False)}"
 
 
 # =============================================================================

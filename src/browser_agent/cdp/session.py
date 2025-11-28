@@ -21,7 +21,6 @@ class SessionStatus(Enum):
 @dataclass
 class TargetInfo:
     """Information about a CDP target."""
-    __slots__ = ('target_id', 'type', 'url', 'title', 'session_id', 'browser_context_id')
     target_id: str
     type: str 
     url: str
@@ -33,7 +32,6 @@ class TargetInfo:
 @dataclass
 class FrameInfo:
     """Information about a frame."""
-    __slots__ = ('frame_id', 'parent_frame_id', 'url', 'origin', 'target_id', 'session_id')
     frame_id: str
     parent_frame_id: Optional[str]
     url: str
@@ -45,7 +43,6 @@ class FrameInfo:
 @dataclass
 class SessionInfo:
     """Information about a CDP session."""
-    __slots__ = ('session_id', 'target_id', 'status', 'domains_enabled', 'created_at')
     session_id: str
     target_id: str
     status: SessionStatus = SessionStatus.ACTIVE

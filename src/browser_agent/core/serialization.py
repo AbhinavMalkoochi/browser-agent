@@ -46,6 +46,9 @@ DEFAULT_ATTR_ALLOWLIST: Tuple[str, ...] = (
     "aria-label",
     "title",
     "placeholder",
+    "href",  # Important for links - shows where they go
+    "src",   # Important for images/iframes
+    "value", # Important for inputs
 )
 
 
